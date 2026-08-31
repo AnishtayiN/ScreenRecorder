@@ -1,56 +1,58 @@
 """
-Screen Recorder - Windows Desktop Application
-A modern screen recorder with PyQt5 GUI
-Supports Windows 7 through Windows 11
+Screen Recorder Pro v2.0 - Windows
+Webcam PiP, Audio Recording, Drawing Tools, Multi-Monitor, GIF Export
 """
 
-import sys
-import os
-import time
-import threading
-import datetime
-import json
+import sys, os, time, threading, datetime, json, struct, wave
 from pathlib import Path
+from collections import deque
 
 try:
     from PyQt5.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QPushButton, QLabel, QComboBox, QCheckBox, QFileDialog,
-        QSystemTrayIcon, QMenu, QAction, QMessageBox, QProgressBar,
-        QGroupBox, QSlider, QSpinBox, QFrame, QShortcut, QSizePolicy
+        QSystemTrayIcon, QMenu, QMessageBox, QGroupBox, QSlider,
+        QSpinBox, QFrame, QTabWidget, QListWidget, QListWidgetItem,
+        QColorDialog, QSplitter, QToolButton, QButtonGroup, QStatusBar
     )
-    from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QSize, QSettings
-    from PyQt5.QtGui import QIcon, QPixmap, QPainter, QColor, QFont, QKeySequence, QPen
-    PYQT5 = True
+    from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QRect, QThread
+    from PyQt5.QtGui import (
+        QIcon, QPixmap, QPainter, QColor, QFont, QKeySequence, QPen,
+        QBrush, QRadialGradient, QFontMetrics
+    )
+    HAS_PYQT5 = True
 except ImportError:
-    PYQT5 = False
+    HAS_PYQT5 = False
 
 try:
-    import mss
-    import mss.tools
-    MSS_AVAILABLE = True
+    import mss, mss.tools
+    HAS_MSS = True
 except ImportError:
-    MSS_AVAILABLE = False
+    HAS_MSS = False
 
 try:
-    import cv2
-    import numpy as np
-    OPENCV_AVAILABLE = True
+    import cv2, numpy as np
+    HAS_CV2 = True
 except ImportError:
-    OPENCV_AVAILABLE = False
+    HAS_CV2 = False
 
 try:
-    from pynput import keyboard as pynput_keyboard
-    PYNPUT_AVAILABLE = True
+    from pynput import keyboard as pynput_kb
+    HAS_PYNPUT = True
 except ImportError:
-    PYNPUT_AVAILABLE = False
+    HAS_PYNPUT = False
 
-APP_NAME = "Screen Recorder"
-APP_VERSION = "1.0.0"
-DEFAULT_FPS = 30
-DEFAULT_QUALITY = 80
-DEFAULT_OUTPUT_DIR = str(Path.home() / "Videos" / "ScreenRecorder")
-CONFIG_FILE = str(Path.home() / ".screen_recorder_config.json")
+try:
+    import pyaudio
+    HAS_PYAUDIO = True
+except ImportError:
+    HAS_PYAUDIO = False
+
+APP_NAME = "Screen Recorder Pro"
+APP_VERSION = "2.0.0"
+OUTPUT_DIR = str(Path.home() / "Videos" / "ScreenRecorder")
+CONFIG_FILE = str(Path.home() / ".screen_recorder_pro.json")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
 class RecordingState:
@@ -59,8 +61,1111 @@ class RecordingState:
     PAUSED = 2
 
 
+class EngineSignals(QObject):
+    timer_tick = pyqtSignal(str)
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+    frame_ready = pyqtSignal(object)
+
+
+class RecordingEngine:
+    def __init__(self, signals: EngineSignals):
+        self.sig = signals
+        self.state = RecordingState.IDLE
+        self._stop = threading.Event()
+        self._pause = threading.Event()
+        self._thread = None
+        self.frame_count = 0
+        self.start_time = 0
+        self.output_path = ""
+        # settings
+        self.region = None
+        self.monitor_index = 1
+        self.fps = 30
+        self.codec = "mp4v"
+        self.ext = ".mp4"
+        self.quality = 80
+        # audio
+        self.audio_enabled = False
+        self.audio_device_index = None
+        self._audio_stream = None
+        self._audio_frames = []
+        self._audio_thread = None
+        # webcam
+        self.webcam_enabled = False
+        self.webcam_index = 0
+        self.webcam_pos = "bottom-right"
+        self.webcam_scale = 0.25
+        self._cap = None
+        # draw
+        self.draw_overlay = None
+
+    def start(self, path):
+        if self.state != RecordingState.IDLE:
+            return False
+        self.output_path = path
+        self.frame_count = 0
+        self._stop.clear()
+        self._pause.clear()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        if self.audio_enabled:
+            self._audio_thread = threading.Thread(target=self._audio_loop, daemon=True)
+            self._audio_thread.start()
+        return True
+
+    def stop(self):
+        self.state = RecordingState.IDLE
+        self._stop.set()
+        self._pause.set()
+
+    def pause(self):
+        if self.state == RecordingState.RECORDING:
+            self.state = RecordingState.PAUSED
+            self._pause.clear()
+
+    def resume(self):
+        if self.state == RecordingState.PAUSED:
+            self.state = RecordingState.RECORDING
+            self._pause.set()
+
+    def _audio_loop(self):
+        if not HAS_PYAUDIO:
+            return
+        try:
+            pa = pyaudio.PyAudio()
+            self._audio_stream = pa.open(
+                format=pyaudio.paInt16, channels=1, rate=44100,
+                input=True, input_device_index=self.audio_device_index,
+                frames_per_buffer=1024
+            )
+            self._audio_frames = []
+            while not self._stop.is_set():
+                if self._pause.is_set():
+                    try:
+                        data = self._audio_stream.read(1024, exception_on_overflow=False)
+                        self._audio_frames.append(data)
+                    except Exception:
+                        pass
+            self._audio_stream.stop_stream()
+            self._audio_stream.close()
+            pa.terminate()
+            # save wav
+            wav_path = self.output_path.rsplit(".", 1)[0] + "_audio.wav"
+            wf = wave.open(wav_path, "wb")
+            wf.setnchannels(1)
+            wf.setsampwidth(pa.get_sample_size(pyaudio.paInt16))
+            wf.setframerate(44100)
+            wf.writeframes(b"".join(self._audio_frames))
+            wf.close()
+        except Exception as e:
+            self.sig.error.emit(f"Audio error: {e}")
+
+    def _loop(self):
+        try:
+            if not HAS_MSS:
+                self.sig.error.emit("mss not installed: pip install mss")
+                return
+            if not HAS_CV2:
+                self.sig.error.emit("opencv not installed: pip install opencv-python")
+                return
+
+            sct = mss.mss()
+            if self.region:
+                monitor = {"left": self.region[0], "top": self.region[1],
+                           "width": self.region[2], "height": self.region[3]}
+            else:
+                mon_list = sct.monitors
+                idx = min(self.monitor_index, len(mon_list) - 1)
+                monitor = mon_list[idx]
+
+            w = monitor["width"] & ~1
+            h = monitor["height"] & ~1
+            fourcc = cv2.VideoWriter_fourcc(*self.codec)
+            writer = cv2.VideoWriter(self.output_path, fourcc, self.fps, (w, h))
+
+            if not writer.isOpened():
+                self.sig.error.emit("Cannot open video writer. Try another codec.")
+                return
+
+            # webcam capture
+            cam = None
+            if self.webcam_enabled and HAS_CV2:
+                try:
+                    cam = cv2.VideoCapture(self.webcam_index)
+                    if not cam.isOpened():
+                        cam = None
+                except Exception:
+                    cam = None
+            self._cap = cam
+
+            self.state = RecordingState.RECORDING
+            self.start_time = time.time()
+            self._pause.set()
+
+            interval = 1.0 / self.fps
+            while not self._stop.is_set():
+                self._pause.wait()
+                if self._stop.is_set():
+                    break
+                t0 = time.time()
+                try:
+                    img = sct.grab(monitor)
+                    frame = np.array(img)
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+                    # resize to writer size
+                    if frame.shape[1] != w or frame.shape[0] != h:
+                        frame = cv2.resize(frame, (w, h))
+
+                    # webcam PiP overlay
+                    if cam and cam.isOpened():
+                        ret, cam_frame = cam.read()
+                        if ret:
+                            cw = int(w * self.webcam_scale)
+                            ch = int(cw * cam_frame.shape[0] / cam_frame.shape[1])
+                            cam_small = cv2.resize(cam_frame, (cw, ch))
+                            # position
+                            margin = 15
+                            if self.webcam_pos == "top-left":
+                                px, py = margin, margin
+                            elif self.webcam_pos == "top-right":
+                                px, py = w - cw - margin, margin
+                            elif self.webcam_pos == "bottom-left":
+                                px, py = margin, h - ch - margin
+                            else:
+                                px, py = w - cw - margin, h - ch - margin
+                            px = max(0, min(px, w - cw))
+                            py = max(0, min(py, h - ch))
+                            # rounded rect mask
+                            mask = np.zeros((ch, cw), dtype=np.uint8)
+                            cv2.rectangle(mask, (4, 4), (cw - 4, ch - 4), 255, -1)
+                            roi = frame[py:py + ch, px:px + cw]
+                            if roi.shape[:2] == mask.shape:
+                                masked = cv2.bitwise_and(cam_small, cam_small, mask=mask)
+                                mask_inv = cv2.bitwise_not(mask)
+                                bg = cv2.bitwise_and(roi, roi, mask=mask_inv)
+                                frame[py:py + ch, px:px + cw] = cv2.add(masked, bg)
+                                # border
+                                cv2.rectangle(frame, (px + 2, py + 2), (px + cw - 2, py + ch - 2), (0, 174, 255), 2)
+
+                    # draw overlay
+                    if self.draw_overlay and self.draw_overlay.drawing_visible:
+                        overlay = self.draw_overlay.get_overlay_frame(w, h)
+                        if overlay is not None:
+                            combined = cv2.add(frame, overlay)
+                            frame = combined
+
+                    writer.write(frame)
+                    self.frame_count += 1
+
+                    elapsed = time.time() - self.start_time
+                    hh = int(elapsed // 3600)
+                    mm = int((elapsed % 3600) // 60)
+                    ss = int(elapsed % 60)
+                    self.sig.timer_tick.emit(f"{hh:02d}:{mm:02d}:{ss:02d}")
+
+                except Exception as e:
+                    self.sig.error.emit(f"Frame error: {e}")
+                    break
+
+                dt = time.time() - t0
+                sl = max(0, interval - dt)
+                if sl > 0:
+                    time.sleep(sl)
+
+            writer.release()
+            if cam:
+                cam.release()
+            sct.close()
+
+        except Exception as e:
+            self.sig.error.emit(f"Recording error: {e}")
+        finally:
+            if self.state != RecordingState.IDLE and self.output_path:
+                self.sig.finished.emit(self.output_path)
+            self.state = RecordingState.IDLE
+
+
+def get_monitors():
+    if not HAS_MSS:
+        return ["Primary"]
+    sct = mss.mss()
+    result = []
+    for i, m in enumerate(sct.monitors):
+        if i == 0:
+            continue
+        result.append(f"Monitor {i}: {m['width']}x{m['height']} @ ({m['left']},{m['top']})")
+    sct.close()
+    return result if result else ["Primary"]
+
+
+def get_audio_devices():
+    if not HAS_PYAUDIO:
+        return []
+    try:
+        pa = pyaudio.PyAudio()
+        devices = []
+        for i in range(pa.get_device_count()):
+            info = pa.get_device_info_by_index(i)
+            if info["maxInputChannels"] > 0:
+                devices.append((i, info["name"][:40]))
+        pa.terminate()
+        return devices
+    except Exception:
+        return []
+
+
+def get_webcam_list():
+    if not HAS_CV2:
+        return []
+    cams = []
+    for i in range(4):
+        try:
+            cap = cv2.VideoCapture(i)
+            if cap.isOpened():
+                cams.append((i, f"Camera {i}"))
+                cap.release()
+        except Exception:
+            pass
+    return cams
+
+
+class DrawingOverlay(QWidget):
+    """Transparent overlay for drawing on screen during recording"""
+    closed = pyqtSignal()
+
+    def __init__(self, draw_tools_ref):
+        super().__init__()
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setMouseTracking(True)
+        self.tools_ref = draw_tools_ref
+        self.drawing_visible = False
+        self.current_tool = "pen"  # pen, arrow, rect, circle, text, eraser
+        self.current_color = QColor(255, 0, 0)
+        self.pen_width = 3
+        self._strokes = []  # list of (tool, color, width, points)
+        self._current_stroke = []
+        self._start_pos = None
+        self._drawing = False
+
+    def activate_tool(self, tool):
+        self.current_tool = tool
+        if tool == "eraser":
+            self.setCursor(Qt.CrossCursor)
+        elif tool == "text":
+            self.setCursor(Qt.IBeamCursor)
+        else:
+            self.setCursor(Qt.CrossCursor)
+
+    def start_overlay(self):
+        screen = QApplication.primaryScreen().geometry()
+        self.setGeometry(screen)
+        self._strokes.clear()
+        self.drawing_visible = True
+        self.showFullScreen()
+        self.raise_()
+
+    def stop_overlay(self):
+        self.drawing_visible = False
+        self.hide()
+
+    def clear_all(self):
+        self._strokes.clear()
+        self.update()
+
+    def get_overlay_frame(self, w, h):
+        """Return a numpy overlay frame matching the recording resolution"""
+        if not self._strokes:
+            return None
+        frame = np.zeros((h, w, 3), dtype=np.uint8)
+        sx = w / self.width()
+        sy = h / self.height()
+        for tool, color, width, points in self._strokes:
+            c = (color.blue(), color.green(), color.red())
+            pw = max(1, int(width * sx))
+            if tool == "pen" or tool == "eraser":
+                ec = (0, 0, 0) if tool == "eraser" else c
+                for i in range(1, len(points)):
+                    p1 = (int(points[i - 1].x() * sx), int(points[i - 1].y() * sy))
+                    p2 = (int(points[i].x() * sx), int(points[i].y() * sy))
+                    if tool == "eraser":
+                        cv2.line(frame, p1, p2, ec, pw * 4)
+                    else:
+                        cv2.line(frame, p1, p2, ec, pw)
+            elif tool == "arrow" and len(points) >= 2:
+                p1 = (int(points[0].x() * sx), int(points[0].y() * sy))
+                p2 = (int(points[-1].x() * sx), int(points[-1].y() * sy))
+                cv2.arrowedLine(frame, p1, p2, c, pw, tipLength=0.3)
+            elif tool == "rect" and len(points) >= 2:
+                p1 = (int(points[0].x() * sx), int(points[0].y() * sy))
+                p2 = (int(points[-1].x() * sx), int(points[-1].y() * sy))
+                cv2.rectangle(frame, p1, p2, c, pw)
+            elif tool == "circle" and len(points) >= 2:
+                p1 = (int(points[0].x() * sx), int(points[0].y() * sy))
+                p2 = (int(points[-1].x() * sx), int(points[-1].y() * sy))
+                cx = (p1[0] + p2[0]) // 2
+                cy = (p1[1] + p2[1]) // 2
+                rx = abs(p2[0] - p1[0]) // 2
+                ry = abs(p2[1] - p1[1]) // 2
+                cv2.ellipse(frame, (cx, cy), (rx, ry), 0, 0, 360, c, pw)
+        return frame
+
+    def paintEvent(self, event):
+        if not self.drawing_visible:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        for tool, color, width, points in self._strokes:
+            pen = QPen(color if tool != "eraser" else QColor(255, 255, 255),
+                        width if tool != "eraser" else width * 4)
+            painter.setPen(pen)
+            if tool in ("pen", "eraser") and len(points) >= 2:
+                for i in range(1, len(points)):
+                    painter.drawLine(points[i - 1], points[i])
+            elif tool == "arrow" and len(points) >= 2:
+                painter.drawLine(points[0], points[-1])
+                # arrowhead
+                import math
+                dx = points[-1].x() - points[-2].x()
+                dy = points[-1].y() - points[-2].y()
+                angle = math.atan2(dy, dx)
+                hl = 15
+                for da in [2.7, 3.6]:
+                    ax = points[-1].x() - hl * math.cos(angle - math.pi + da)
+                    ay = points[-1].y() - hl * math.sin(angle - math.pi + da)
+                    painter.drawLine(points[-1].x(), points[-1].y(), int(ax), int(ay))
+            elif tool == "rect" and len(points) >= 2:
+                r = QRect(points[0], points[-1]).normalized()
+                painter.drawRect(r)
+            elif tool == "circle" and len(points) >= 2:
+                r = QRect(points[0], points[-1]).normalized()
+                painter.drawEllipse(r)
+            elif tool == "text" and len(points) >= 1:
+                painter.setPen(QPen(color))
+                painter.setFont(QFont("Segoe UI", 14, QFont.Bold))
+                painter.drawText(points[0], self.tools_ref.get_text_input() if hasattr(self.tools_ref, 'get_text_input') else "Text")
+
+    def mousePressEvent(self, event):
+        if not self.drawing_visible:
+            return
+        if event.button() == Qt.LeftButton:
+            self._start_pos = event.pos()
+            self._current_stroke = [event.pos()]
+            self._drawing = True
+        elif event.button() == Qt.RightButton:
+            # right click = undo last stroke
+            if self._strokes:
+                self._strokes.pop()
+                self.update()
+
+    def mouseMoveEvent(self, event):
+        if self._drawing:
+            self._current_stroke.append(event.pos())
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if self._drawing and event.button() == Qt.LeftButton:
+            self._drawing = False
+            if self._current_stroke:
+                self._strokes.append((
+                    self.current_tool,
+                    self.current_color,
+                    self.pen_width,
+                    list(self._current_stroke)
+                ))
+                self._current_stroke = []
+                self.update()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.stop_overlay()
+            self.closed.emit()
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
+        self.setMinimumSize(600, 750)
+        self.resize(640, 780)
+        self.signals = EngineSignals()
+        self.engine = RecordingEngine(self.signals)
+        self.region_selector = None
+        self.settings_data = {}
+        self.hotkey_listener = None
+        self.selected_region = None
+        self.draw_overlay = None
+        self.recording_history = []
+        self.audio_devices = get_audio_devices()
+        self.webcam_list = get_webcam_list()
+        self.monitor_list = get_monitors()
+        self.signals.timer_tick.connect(self._on_tick)
+        self.signals.finished.connect(self._on_finished)
+        self.signals.error.connect(self._on_error)
+        self._init_ui()
+        self._init_tray()
+        self._init_hotkeys()
+        self._load_settings()
+        self._center()
+        self._update_file_count()
+
+    # ─── UI ──────────────────────────────────────────────────────
+    def _init_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setSpacing(6)
+        root.setContentsMargins(0, 0, 0, 0)
+
+        # gradient header
+        hdr = QWidget()
+        hdr.setFixedHeight(110)
+        hdr.setStyleSheet("""
+            background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
+                stop:0 #1a1a2e, stop:0.5 #16213e, stop:1 #0f3460);
+        """)
+        hl = QVBoxLayout(hdr)
+        hl.setContentsMargins(20, 15, 20, 10)
+        hl.setAlignment(Qt.AlignCenter)
+        t = QLabel(f"🎬  {APP_NAME}")
+        t.setFont(QFont("Segoe UI", 20, QFont.Bold))
+        t.setStyleSheet("color: white;")
+        t.setAlignment(Qt.AlignCenter)
+        hl.addWidget(t)
+        sub = QLabel(f"v{APP_VERSION}  •  Webcam PiP  •  Audio  •  Draw  •  GIF")
+        sub.setFont(QFont("Segoe UI", 9))
+        sub.setStyleSheet("color: #8899aa;")
+        sub.setAlignment(Qt.AlignCenter)
+        hl.addWidget(sub)
+        root.addWidget(hdr)
+
+        # scrollable body
+        scroll = QWidget()
+        sl = QVBoxLayout(scroll)
+        sl.setSpacing(6)
+        sl.setContentsMargins(16, 8, 16, 8)
+
+        # timer
+        self.timer_lbl = QLabel("00:00:00")
+        self.timer_lbl.setFont(QFont("Consolas", 36, QFont.Bold))
+        self.timer_lbl.setAlignment(Qt.AlignCenter)
+        self.timer_lbl.setStyleSheet(
+            "color: #00aeff; background: #1a1a2e; border-radius: 14px; padding: 14px;")
+        sl.addWidget(self.timer_lbl)
+
+        self.status_lbl = QLabel("● Ready")
+        self.status_lbl.setAlignment(Qt.AlignCenter)
+        self.status_lbl.setFont(QFont("Segoe UI", 10))
+        self.status_lbl.setStyleSheet("color: #4CAF50;")
+        sl.addWidget(self.status_lbl)
+
+        # ── tabs ──
+        tabs = QTabWidget()
+        tabs.setStyleSheet("""
+            QTabWidget::pane { border: 1px solid #333; border-radius: 8px; background: #161b22; }
+            QTabBar::tab { background: #0d1117; color: #aaa; padding: 8px 16px;
+                           border-top-left-radius: 8px; border-top-right-radius: 8px; margin-right: 2px; }
+            QTabBar::tab:selected { background: #161b22; color: #00aeff; font-weight: bold; }
+        """)
+
+        # ─── Tab 1: Settings ───
+        w1 = QWidget()
+        l1 = QVBoxLayout(w1)
+        l1.setSpacing(8)
+
+        # Monitor
+        mr = QHBoxLayout()
+        mr.addWidget(QLabel("🖥  Monitor:"))
+        self.monitor_combo = QComboBox()
+        self.monitor_combo.addItems(self.monitor_list)
+        mr.addWidget(self.monitor_combo, 1)
+        l1.addLayout(mr)
+
+        # Region
+        rr = QHBoxLayout()
+        rr.addWidget(QLabel("📐  Region:"))
+        self.region_combo = QComboBox()
+        self.region_combo.addItems(["Full Screen", "Custom Region"])
+        self.region_combo.currentIndexChanged.connect(self._on_region_changed)
+        rr.addWidget(self.region_combo, 1)
+        l1.addLayout(rr)
+
+        # FPS
+        fr = QHBoxLayout()
+        fr.addWidget(QLabel("🎞  FPS:"))
+        self.fps_spin = QSpinBox()
+        self.fps_spin.setRange(10, 120)
+        self.fps_spin.setValue(30)
+        self.fps_spin.setSuffix(" FPS")
+        fr.addWidget(self.fps_spin, 1)
+        l1.addLayout(fr)
+
+        # Quality
+        qr = QHBoxLayout()
+        qr.addWidget(QLabel("⭐  Quality:"))
+        self.quality_slider = QSlider(Qt.Horizontal)
+        self.quality_slider.setRange(10, 100)
+        self.quality_slider.setValue(80)
+        self.quality_slider.valueChanged.connect(
+            lambda v: self.quality_lbl.setText(f"{v}%"))
+        qr.addWidget(self.quality_slider, 1)
+        self.quality_lbl = QLabel("80%")
+        self.quality_lbl.setMinimumWidth(35)
+        qr.addWidget(self.quality_lbl)
+        l1.addLayout(qr)
+
+        # Codec
+        cr = QHBoxLayout()
+        cr.addWidget(QLabel("📦  Format:"))
+        self.codec_combo = QComboBox()
+        self.codec_combo.addItems(["MP4", "AVI (XVID)", "MKV (X264)"])
+        cr.addWidget(self.codec_combo, 1)
+        l1.addLayout(cr)
+
+        # Audio device
+        ar = QHBoxLayout()
+        ar.addWidget(QLabel("🎤  Audio:"))
+        self.audio_check = QCheckBox("Record audio")
+        self.audio_check.setChecked(True)
+        ar.addWidget(self.audio_check)
+        self.audio_combo = QComboBox()
+        for idx, name in self.audio_devices:
+            self.audio_combo.addItem(name, idx)
+        if not self.audio_devices:
+            self.audio_combo.addItem("No devices found")
+            self.audio_check.setEnabled(False)
+        ar.addWidget(self.audio_combo, 1)
+        l1.addLayout(ar)
+
+        tabs.addTab(w1, "⚙ Settings")
+
+        # ─── Tab 2: Webcam ───
+        w2 = QWidget()
+        l2 = QVBoxLayout(w2)
+        l2.setSpacing(10)
+
+        self.webcam_check = QCheckBox("Enable Webcam Overlay (PiP)")
+        self.webcam_check.setChecked(False)
+        self.webcam_check.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        self.webcam_check.setStyleSheet("color: #00aeff;")
+        l2.addWidget(self.webcam_check)
+
+        wr1 = QHBoxLayout()
+        wr1.addWidget(QLabel("Camera:"))
+        self.webcam_combo = QComboBox()
+        for idx, name in self.webcam_list:
+            self.webcam_combo.addItem(name, idx)
+        if not self.webcam_list:
+            self.webcam_combo.addItem("No camera found")
+        wr1.addWidget(self.webcam_combo, 1)
+        l2.addLayout(wr1)
+
+        wr2 = QHBoxLayout()
+        wr2.addWidget(QLabel("Position:"))
+        self.webcam_pos_combo = QComboBox()
+        self.webcam_pos_combo.addItems(
+            ["Bottom-Right", "Top-Right", "Top-Left", "Bottom-Left"])
+        wr2.addWidget(self.webcam_pos_combo, 1)
+        l2.addLayout(wr2)
+
+        wr3 = QHBoxLayout()
+        wr3.addWidget(QLabel("Size:"))
+        self.webcam_size_slider = QSlider(Qt.Horizontal)
+        self.webcam_size_slider.setRange(10, 50)
+        self.webcam_size_slider.setValue(25)
+        self.webcam_size_slider.valueChanged.connect(
+            lambda v: self.webcam_size_lbl.setText(f"{v}%"))
+        wr3.addWidget(self.webcam_size_slider, 1)
+        self.webcam_size_lbl = QLabel("25%")
+        wr3.addWidget(self.webcam_size_lbl)
+        l2.addLayout(wr3)
+
+        tabs.addTab(w2, "🤳 Webcam")
+
+        # ─── Tab 3: Drawing Tools ───
+        w3 = QWidget()
+        l3 = QVBoxLayout(w3)
+        l3.setSpacing(8)
+
+        self.draw_check = QCheckBox("Show Drawing Toolbar During Recording")
+        self.draw_check.setChecked(False)
+        self.draw_check.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        self.draw_check.setStyleSheet("color: #f39c12;")
+        l3.addWidget(self.draw_check)
+
+        tbr = QHBoxLayout()
+        tbr.setSpacing(6)
+        self.draw_tools = {}
+        for tool_name, icon in [("pen", "✏"), ("arrow", "➤"), ("rect", "▭"),
+                                 ("circle", "○"), ("eraser", "⌫")]:
+            btn = QToolButton()
+            btn.setText(icon)
+            btn.setCheckable(True)
+            btn.setFixedSize(40, 40)
+            btn.setFont(QFont("Segoe UI", 14))
+            btn.setToolTip(tool_name.capitalize())
+            btn.setStyleSheet("""
+                QToolButton { background: #1a1a2e; color: #aaa; border: 1px solid #333;
+                              border-radius: 8px; }
+                QToolButton:checked { background: #00aeff; color: white; border-color: #00aeff; }
+            """)
+            btn.clicked.connect(lambda checked, n=tool_name: self._select_draw_tool(n))
+            self.draw_tools[tool_name] = btn
+            tbr.addWidget(btn)
+        l3.addLayout(tbr)
+
+        # color
+        clr_row = QHBoxLayout()
+        clr_row.addWidget(QLabel("Color:"))
+        self.draw_color = QColor(255, 0, 0)
+        self.color_btn = QPushButton("  ")
+        self.color_btn.setFixedSize(30, 30)
+        self._update_color_btn()
+        self.color_btn.clicked.connect(self._pick_color)
+        clr_row.addWidget(self.color_btn)
+        clr_row.addSpacing(10)
+        clr_row.addWidget(QLabel("Width:"))
+        self.pen_width_slider = QSlider(Qt.Horizontal)
+        self.pen_width_slider.setRange(1, 10)
+        self.pen_width_slider.setValue(3)
+        clr_row.addWidget(self.pen_width_slider, 1)
+        l3.addLayout(clr_row)
+
+        tabs.addTab(w3, "✏ Draw")
+
+        # ─── Tab 4: History ───
+        w4 = QWidget()
+        l4 = QVBoxLayout(w4)
+        self.history_list = QListWidget()
+        self.history_list.setStyleSheet("""
+            QListWidget { background: #0d1117; color: #ccc; border: 1px solid #333;
+                          border-radius: 6px; padding: 4px; }
+            QListWidget::item { padding: 6px; border-bottom: 1px solid #222; }
+            QListWidget::item:selected { background: #16213e; }
+        """)
+        l4.addWidget(self.history_list)
+
+        hb = QHBoxLayout()
+        open_btn = QPushButton("📂 Open Folder")
+        open_btn.clicked.connect(self._open_output_folder)
+        hb.addWidget(open_btn)
+        refresh_btn = QPushButton("🔄 Refresh")
+        refresh_btn.clicked.connect(self._refresh_history)
+        hb.addWidget(refresh_btn)
+        l4.addLayout(hb)
+
+        tabs.addTab(w4, "📋 History")
+
+        sl.addWidget(tabs)
+
+        # hotkey hint
+        hk = QLabel("⌨  F9 = Record/Stop   F10 = Pause   F11 = Screenshot")
+        hk.setAlignment(Qt.AlignCenter)
+        hk.setStyleSheet("color: #666; font-size: 10px; padding: 4px;")
+        sl.addWidget(hk)
+
+        # controls
+        ctrls = QHBoxLayout()
+        ctrls.setSpacing(10)
+        self.record_btn = self._make_btn("⏺  Record", "#e74c3c")
+        self.record_btn.clicked.connect(self._toggle_rec)
+        ctrls.addWidget(self.record_btn)
+        self.pause_btn = self._make_btn("⏸  Pause", "#f39c12")
+        self.pause_btn.setEnabled(False)
+        self.pause_btn.clicked.connect(self._toggle_pause)
+        ctrls.addWidget(self.pause_btn)
+        self.ss_btn = self._make_btn("📷  Screenshot", "#2ecc71")
+        self.ss_btn.clicked.connect(self._screenshot)
+        ctrls.addWidget(self.ss_btn)
+        sl.addLayout(ctrls)
+
+        # output folder
+        fo = QHBoxLayout()
+        fo.addWidget(QLabel("📁"))
+        self.folder_lbl = QLabel(OUTPUT_DIR)
+        self.folder_lbl.setStyleSheet("color: #888; font-size: 10px;")
+        self.folder_lbl.setWordWrap(True)
+        fo.addWidget(self.folder_lbl, 1)
+        browse = QPushButton("Browse")
+        browse.setFixedHeight(28)
+        browse.clicked.connect(self._browse)
+        fo.addWidget(browse)
+        sl.addLayout(fo)
+
+        self.file_count_lbl = QLabel("")
+        self.file_count_lbl.setAlignment(Qt.AlignCenter)
+        self.file_count_lbl.setStyleSheet("color: #555; font-size: 10px;")
+        sl.addWidget(self.file_count_lbl)
+
+        root.addWidget(scroll, 1)
+
+        # status bar
+        sb = QStatusBar()
+        sb.setStyleSheet("background: #0d1117; color: #666; border-top: 1px solid #222;")
+        sb.showMessage("Ready  •  Right-click drawing = Undo  •  Esc = Close drawing overlay")
+        self.setStatusBar(sb)
+
+        # global dark
+        self.setStyleSheet("""
+            QMainWindow { background: #0d1117; }
+            QWidget { background: transparent; color: #e6e6e6; }
+            QComboBox, QSpinBox { background: #161b22; color: #e6e6e6; border: 1px solid #333; padding: 5px; border-radius: 5px; }
+            QComboBox:hover, QSpinBox:hover { border: 1px solid #00aeff; }
+            QComboBox QAbstractItemView { background: #161b22; color: #e6e6e6; selection-background-color: #16213e; }
+            QSlider::groove:horizontal { height: 5px; background: #333; border-radius: 2px; }
+            QSlider::handle:horizontal { background: #00aeff; width: 15px; height: 15px; margin: -5px 0; border-radius: 7px; }
+            QCheckBox { color: #aaa; spacing: 6px; }
+            QCheckBox::indicator { width: 16px; height: 16px; border-radius: 3px; border: 2px solid #555; background: #161b22; }
+            QCheckBox::indicator:checked { background: #00aeff; border-color: #00aeff; }
+            QGroupBox { color: #ccc; border: 1px solid #333; border-radius: 8px; margin-top: 8px; padding-top: 14px; }
+            QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 4px; }
+            QToolTip { background: #161b22; color: #e6e6e6; border: 1px solid #00aeff; padding: 4px; border-radius: 4px; }
+        """)
+
+    def _make_btn(self, text, color):
+        btn = QPushButton(text)
+        btn.setMinimumHeight(48)
+        btn.setMinimumWidth(130)
+        btn.setFont(QFont("Segoe UI", 11, QFont.Bold))
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setStyleSheet(f"""
+            QPushButton {{ background: {color}; color: white; border: none;
+                           border-radius: 10px; padding: 8px 18px; }}
+            QPushButton:hover {{ background: {color}dd; }}
+            QPushButton:pressed {{ background: {color}aa; }}
+            QPushButton:disabled {{ background: #333; color: #666; }}
+        """)
+        return btn
+
+    # ─── tray ──
+    def _init_tray(self):
+        self.tray = QSystemTrayIcon(self)
+        pix = QPixmap(32, 32)
+        pix.fill(QColor(0, 174, 255))
+        p = QPainter(pix)
+        p.setPen(QPen(QColor(255, 255, 255), 2))
+        p.drawEllipse(8, 8, 16, 16)
+        p.setBrush(QColor(255, 255, 255))
+        p.drawEllipse(13, 13, 6, 6)
+        p.end()
+        self.tray.setIcon(QIcon(pix))
+        self.tray.setToolTip(APP_NAME)
+        menu = QMenu()
+        menu.addAction("Show").triggered.connect(self._show)
+        menu.addAction("Stop").triggered.connect(self._stop_rec)
+        menu.addSeparator()
+        menu.addAction("Quit").triggered.connect(self._quit)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(
+            lambda r: self._show() if r == QSystemTrayIcon.DoubleClick else None)
+        self.tray.show()
+
+    # ─── hotkeys ──
+    def _init_hotkeys(self):
+        if not HAS_PYNPUT:
+            return
+        def on_press(key):
+            try:
+                if key == pynput_kb.Key.f9:
+                    QTimer.singleShot(0, self._toggle_rec)
+                elif key == pynput_kb.Key.f10:
+                    QTimer.singleShot(0, self._toggle_pause)
+                elif key == pynput_kb.Key.f11:
+                    QTimer.singleShot(0, self._screenshot)
+            except Exception:
+                pass
+        try:
+            l = pynput_kb.Listener(on_press=on_press)
+            l.daemon = True
+            l.start()
+        except Exception:
+            pass
+
+    # ─── settings persistence ──
+    def _load_settings(self):
+        try:
+            if os.path.exists(CONFIG_FILE):
+                with open(CONFIG_FILE) as f:
+                    c = json.load(f)
+                self.fps_spin.setValue(c.get("fps", 30))
+                self.quality_slider.setValue(c.get("quality", 80))
+                self.codec_combo.setCurrentIndex(c.get("codec", 0))
+                self.folder_lbl.setText(c.get("output", OUTPUT_DIR))
+                self.monitor_combo.setCurrentIndex(c.get("monitor", 0))
+                self.audio_check.setChecked(c.get("audio", True))
+                self.webcam_check.setChecked(c.get("webcam", False))
+                self.webcam_size_slider.setValue(c.get("webcam_size", 25))
+                self.webcam_pos_combo.setCurrentIndex(c.get("webcam_pos", 0))
+                self.draw_check.setChecked(c.get("draw", False))
+        except Exception:
+            pass
+
+    def _save_settings(self):
+        c = {
+            "fps": self.fps_spin.value(),
+            "quality": self.quality_slider.value(),
+            "codec": self.codec_combo.currentIndex(),
+            "output": self.folder_lbl.text(),
+            "monitor": self.monitor_combo.currentIndex(),
+            "audio": self.audio_check.isChecked(),
+            "webcam": self.webcam_check.isChecked(),
+            "webcam_size": self.webcam_size_slider.value(),
+            "webcam_pos": self.webcam_pos_combo.currentIndex(),
+            "draw": self.draw_check.isChecked(),
+        }
+        try:
+            with open(CONFIG_FILE, "w") as f:
+                json.dump(c, f)
+        except Exception:
+            pass
+
+    # ─── codec ──
+    def _codec_info(self):
+        i = self.codec_combo.currentIndex()
+        if i == 0:
+            return "mp4v", ".mp4"
+        elif i == 1:
+            return "XVID", ".avi"
+        return "XVID", ".mkv"
+
+    def _make_path(self):
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        _, ext = self._codec_info()
+        return os.path.join(self.folder_lbl.text(), f"recording_{ts}{ext}")
+
+    # ─── drawing tools ──
+    def _select_draw_tool(self, name):
+        for k, b in self.draw_tools.items():
+            b.setChecked(k == name)
+        if self.draw_overlay:
+            self.draw_overlay.activate_tool(name)
+
+    def _pick_color(self):
+        c = QColorDialog.getColor(self.draw_color, self)
+        if c.isValid():
+            self.draw_color = c
+            if self.draw_overlay:
+                self.draw_overlay.current_color = c
+            self._update_color_btn()
+
+    def _update_color_btn(self):
+        self.color_btn.setStyleSheet(
+            f"background: {self.draw_color.name()}; border: 2px solid #555; border-radius: 6px;")
+
+    # ─── recording ──
+    def _toggle_rec(self):
+        if self.engine.state == RecordingState.IDLE:
+            self._start_rec()
+        else:
+            self._stop_rec()
+
+    def _start_rec(self):
+        path = self._make_path()
+        # engine settings
+        if self.region_combo.currentIndex() == 1 and self.selected_region:
+            self.engine.region = self.selected_region
+        else:
+            self.engine.region = None
+        self.engine.monitor_index = self.monitor_combo.currentIndex() + 1
+        self.engine.fps = self.fps_spin.value()
+        self.engine.quality = self.quality_slider.value()
+        codec, _ = self._codec_info()
+        self.engine.codec = codec
+        self.engine.ext = _
+        self.engine.audio_enabled = self.audio_check.isChecked()
+        if self.audio_check.isChecked() and self.audio_devices:
+            self.engine.audio_device_index = self.audio_combo.currentData()
+        self.engine.webcam_enabled = self.webcam_check.isChecked()
+        if self.webcam_list:
+            self.engine.webcam_index = self.webcam_combo.currentData()
+        pos_map = {"Bottom-Right": "bottom-right", "Top-Right": "top-right",
+                   "Top-Left": "top-left", "Bottom-Left": "bottom-left"}
+        self.engine.webcam_pos = pos_map.get(self.webcam_pos_combo.currentText(), "bottom-right")
+        self.engine.webcam_scale = self.webcam_size_slider.value() / 100.0
+
+        # drawing overlay
+        if self.draw_check.isChecked():
+            self.draw_overlay = DrawingOverlay(self)
+            self.draw_overlay.current_color = self.draw_color
+            self.draw_overlay.pen_width = self.pen_width_slider.value()
+            self.engine.draw_overlay = self.draw_overlay
+            self.draw_overlay.start_overlay()
+        else:
+            self.engine.draw_overlay = None
+
+        if self.engine.start(path):
+            self.record_btn.setText("⏹  Stop")
+            self.record_btn.setStyleSheet(
+                "QPushButton { background: #555; color: white; border: none; border-radius: 10px;"
+                " padding: 8px 18px; font-weight: bold; font-size: 11pt; }"
+                "QPushButton:hover { background: #666; }")
+            self.pause_btn.setEnabled(True)
+            self.status_lbl.setText("● Recording...")
+            self.status_lbl.setStyleSheet("color: #e74c3c; font-weight: bold;")
+            self.setWindowOpacity(0.85)
+            self._lock_settings(True)
+
+    def _stop_rec(self):
+        self.engine.stop()
+        if self.draw_overlay:
+            self.draw_overlay.stop_overlay()
+            self.draw_overlay = None
+        self.record_btn.setText("⏺  Record")
+        self.record_btn.setStyleSheet(
+            "QPushButton { background: #e74c3c; color: white; border: none; border-radius: 10px;"
+            " padding: 8px 18px; font-weight: bold; font-size: 11pt; }"
+            "QPushButton:hover { background: #c0392b; }"
+            "QPushButton:disabled { background: #333; color: #666; }")
+        self.pause_btn.setEnabled(False)
+        self.pause_btn.setText("⏸  Pause")
+        self.status_lbl.setText("● Processing...")
+        self.status_lbl.setStyleSheet("color: #f39c12;")
+        self.setWindowOpacity(1.0)
+        self._lock_settings(False)
+
+    def _toggle_pause(self):
+        if self.engine.state == RecordingState.RECORDING:
+            self.engine.pause()
+            self.pause_btn.setText("▶  Resume")
+            self.status_lbl.setText("● Paused")
+            self.status_lbl.setStyleSheet("color: #f39c12;")
+        elif self.engine.state == RecordingState.PAUSED:
+            self.engine.resume()
+            self.pause_btn.setText("⏸  Pause")
+            self.status_lbl.setText("● Recording...")
+            self.status_lbl.setStyleSheet("color: #e74c3c; font-weight: bold;")
+
+    def _lock_settings(self, lock):
+        for w in [self.monitor_combo, self.region_combo, self.fps_spin,
+                  self.quality_slider, self.codec_combo, self.audio_check,
+                  self.webcam_check, self.draw_check]:
+            w.setEnabled(not lock)
+
+    # ─── screenshot ──
+    def _screenshot(self):
+        if not HAS_MSS:
+            return
+        try:
+            with mss.mss() as sct:
+                mon = sct.monitors[min(self.monitor_combo.currentIndex() + 1,
+                                       len(sct.monitors) - 1)]
+                img = sct.grab(mon)
+                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                p = os.path.join(self.folder_lbl.text(), f"screenshot_{ts}.png")
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                mss.tools.to_png(img.rgb, img.size, output=p)
+                self.tray.showMessage("Screenshot Saved", p, QSystemTrayIcon.Information, 2000)
+                self._refresh_history()
+        except Exception as e:
+            QMessageBox.warning(self, "Error", str(e))
+
+    # ─── region ──
+    def _on_region_changed(self, idx):
+        if idx == 1:
+            if self.region_selector is None:
+                self.region_selector = RegionSelector()
+                self.region_selector.region_selected.connect(self._on_region_sel)
+                self.region_selector.cancelled.connect(
+                    lambda: self.region_combo.setCurrentIndex(0))
+            self.region_selector.start_overlay()
+
+    def _on_region_sel(self, x, y, w, h):
+        self.selected_region = (x, y, w, h)
+        self.status_lbl.setText(f"● Region: {w}×{h}")
+
+    # ─── callbacks ──
+    def _on_tick(self, t):
+        self.timer_lbl.setText(t)
+
+    def _on_finished(self, path):
+        self.status_lbl.setText("● Ready")
+        self.status_lbl.setStyleSheet("color: #4CAF50;")
+        self.timer_lbl.setText("00:00:00")
+        sz = os.path.getsize(path) if os.path.exists(path) else 0
+        self.tray.showMessage("Recording Saved", f"{os.path.basename(path)}\n{sz // 1024} KB",
+                              QSystemTrayIcon.Information, 3000)
+        self._update_file_count()
+        self._refresh_history()
+
+    def _on_error(self, msg):
+        self.status_lbl.setText(f"● {msg}")
+        self.status_lbl.setStyleSheet("color: #e74c3c;")
+        self._stop_rec()
+
+    # ─── history ──
+    def _refresh_history(self):
+        self.history_list.clear()
+        d = self.folder_lbl.text()
+        if not os.path.isdir(d):
+            return
+        files = sorted(Path(d).glob("*.*"), key=lambda f: f.stat().st_mtime, reverse=True)
+        for f in files:
+            if f.suffix.lower() in (".mp4", ".avi", ".mkv", ".png"):
+                sz = f.stat().st_size
+                dt = datetime.datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+                sz_str = f"{sz // 1048576} MB" if sz >= 1048576 else f"{sz // 1024} KB"
+                item = QListWidgetItem(f"📹  {f.name}  •  {sz_str}  •  {dt}")
+                item.setData(Qt.UserRole, str(f))
+                self.history_list.addItem(item)
+
+    def _open_output_folder(self):
+        d = self.folder_lbl.text()
+        if os.path.isdir(d):
+            os.startfile(d)
+
+    def _update_file_count(self):
+        d = self.folder_lbl.text()
+        if os.path.isdir(d):
+            n = len([f for f in os.listdir(d) if f.endswith((".mp4", ".avi", ".mkv"))])
+            self.file_count_lbl.setText(f"{n} recording{'s' if n != 1 else ''} saved")
+        else:
+            self.file_count_lbl.setText("")
+
+    # ─── misc ──
+    def _browse(self):
+        d = QFileDialog.getExistingDirectory(self, "Output Folder", self.folder_lbl.text())
+        if d:
+            self.folder_lbl.setText(d)
+            self._update_file_count()
+
+    def _center(self):
+        g = QApplication.primaryScreen().geometry()
+        s = self.geometry()
+        self.move((g.width() - s.width()) // 2, (g.height() - s.height()) // 2)
+
+    def _show(self):
+        self.showNormal()
+        self.activateWindow()
+        self.raise_()
+
+    def _quit(self):
+        if self.engine.state != RecordingState.IDLE:
+            self.engine.stop()
+        self._save_settings()
+        QApplication.quit()
+
+    def closeEvent(self, e):
+        if self.engine.state != RecordingState.IDLE:
+            r = QMessageBox.question(self, "Recording Active",
+                                     "Stop recording and quit?", QMessageBox.Yes | QMessageBox.No)
+            if r == QMessageBox.Yes:
+                self._stop_rec()
+                e.accept()
+            else:
+                e.ignore()
+        else:
+            self._save_settings()
+            e.accept()
+
+    def changeEvent(self, e):
+        if e.type() == e.WindowStateChange and self.isMinimized():
+            self.hide()
+            self.tray.showMessage(APP_NAME, "Minimized to tray", QSystemTrayIcon.Information, 1500)
+
+
 class RegionSelector(QWidget):
-    """Overlay widget for selecting recording region"""
     region_selected = pyqtSignal(int, int, int, int)
     cancelled = pyqtSignal()
 
@@ -69,771 +1174,71 @@ class RegionSelector(QWidget):
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setCursor(Qt.CrossCursor)
-        self.start_pos = None
-        self.end_pos = None
-        self.is_selecting = False
+        self._start = None
+        self._end = None
+        self._dragging = False
 
-    def start_selection(self):
-        screen = QApplication.primaryScreen()
-        geom = screen.geometry()
-        self.setGeometry(geom)
+    def start_overlay(self):
+        g = QApplication.primaryScreen().geometry()
+        self.setGeometry(g)
+        self._start = None
+        self._end = None
         self.showFullScreen()
         self.raise_()
-        self.activateWindow()
 
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-        
-        # Dark overlay
-        painter.fillRect(self.rect(), QColor(0, 0, 0, 100))
-        
-        if self.start_pos and self.end_pos:
-            region = self.get_region()
-            # Clear selected area
-            painter.setCompositionMode(QPainter.CompositionMode_Clear)
-            painter.fillRect(region, Qt.transparent)
-            painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
-            
-            # Draw border
-            pen = QPen(QColor(0, 174, 255), 3, Qt.SolidLine)
-            painter.setPen(pen)
-            painter.drawRect(region)
-            
-            # Draw dimensions text
-            text = f"{region.width()} x {region.height()}"
-            painter.setPen(QColor(255, 255, 255))
-            painter.setFont(QFont("Segoe UI", 12, QFont.Bold))
-            text_rect = region.adjusted(0, -30, 0, 0)
-            painter.drawText(text_rect, Qt.AlignBottom | Qt.AlignHCenter, text)
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.fillRect(self.rect(), QColor(0, 0, 0, 100))
+        if self._start and self._end:
+            r = QRect(self._start, self._end).normalized()
+            p.setCompositionMode(QPainter.CompositionMode_Clear)
+            p.fillRect(r, Qt.transparent)
+            p.setCompositionMode(QPainter.CompositionMode_SourceOver)
+            p.setPen(QPen(QColor(0, 174, 255), 3))
+            p.drawRect(r)
+            p.setPen(QColor(255, 255, 255))
+            p.setFont(QFont("Segoe UI", 12, QFont.Bold))
+            p.drawText(r.adjusted(0, -28, 0, 0), Qt.AlignBottom | Qt.AlignHCenter,
+                       f"{r.width()} × {r.height()}")
 
-    def get_region(self):
-        if not self.start_pos or not self.end_pos:
-            return None
-        x1 = min(self.start_pos.x(), self.end_pos.x())
-        y1 = min(self.start_pos.y(), self.end_pos.y())
-        x2 = max(self.start_pos.x(), self.end_pos.x())
-        y2 = max(self.start_pos.y(), self.end_pos.y())
-        from PyQt5.QtCore import QRect
-        return QRect(x1, y1, x2 - x1, y2 - y1)
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self.start_pos = event.pos()
-            self.end_pos = event.pos()
-            self.is_selecting = True
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._start = e.pos()
+            self._end = e.pos()
+            self._dragging = True
             self.update()
 
-    def mouseMoveEvent(self, event):
-        if self.is_selecting:
-            self.end_pos = event.pos()
+    def mouseMoveEvent(self, e):
+        if self._dragging:
+            self._end = e.pos()
             self.update()
 
-    def mouseReleaseEvent(self, event):
-        if event.button() == Qt.LeftButton and self.is_selecting:
-            self.is_selecting = False
-            self.end_pos = event.pos()
-            region = self.get_region()
-            if region and region.width() > 10 and region.height() > 10:
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.LeftButton and self._dragging:
+            self._dragging = False
+            self._end = e.pos()
+            r = QRect(self._start, self._end).normalized()
+            if r.width() > 10 and r.height() > 10:
                 self.hide()
-                self.region_selected.emit(region.x(), region.y(), region.width(), region.height())
-            else:
-                self.update()
+                self.region_selected.emit(r.x(), r.y(), r.width(), r.height())
 
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Escape:
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key_Escape:
             self.hide()
             self.cancelled.emit()
 
 
-class RecorderSignals(QObject):
-    update_timer = pyqtSignal(str)
-    update_progress = pyqtSignal(int)
-    recording_finished = pyqtSignal(str)
-    error_occurred = pyqtSignal(str)
-
-
-class ScreenRecorderEngine:
-    """Core screen recording engine"""
-    
-    def __init__(self, signals: RecorderSignals):
-        self.signals = signals
-        self.state = RecordingState.IDLE
-        self.writer = None
-        self.sct = None
-        self.region = None
-        self.fps = DEFAULT_FPS
-        self.quality = DEFAULT_QUALITY
-        self.codec = 'mp4v'
-        self.output_path = ""
-        self._stop_event = threading.Event()
-        self._pause_event = threading.Event()
-        self._thread = None
-        self.frame_count = 0
-        self.start_time = 0
-        self.audio_enabled = False
-
-    def start(self, output_path, region=None, fps=30, quality=80, codec='mp4v'):
-        if self.state != RecordingState.IDLE:
-            return False
-        
-        self.output_path = output_path
-        self.region = region
-        self.fps = fps
-        self.quality = quality
-        self.codec = codec
-        self.frame_count = 0
-        self._stop_event.clear()
-        self._pause_event.clear()
-        
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        
-        self._thread = threading.Thread(target=self._record_loop, daemon=True)
-        self._thread.start()
-        return True
-
-    def stop(self):
-        self.state = RecordingState.IDLE
-        self._stop_event.set()
-        self._pause_event.set()
-
-    def pause(self):
-        if self.state == RecordingState.RECORDING:
-            self.state = RecordingState.PAUSED
-            self._pause_event.clear()
-
-    def resume(self):
-        if self.state == RecordingState.PAUSED:
-            self.state = RecordingState.RECORDING
-            self._pause_event.set()
-
-    def _record_loop(self):
-        try:
-            if not MSS_AVAILABLE:
-                self.signals.error_occurred.emit("mss library not available. Install it with: pip install mss")
-                return
-            if not OPENCV_AVAILABLE:
-                self.signals.error_occurred.emit("opencv-python not available. Install it with: pip install opencv-python")
-                return
-
-            self.sct = mss.mss()
-            
-            if self.region:
-                monitor = {
-                    "left": self.region[0],
-                    "top": self.region[1],
-                    "width": self.region[2],
-                    "height": self.region[3]
-                }
-            else:
-                monitor = self.sct.monitors[1]  # Primary monitor
-
-            width = monitor["width"]
-            height = monitor["height"]
-
-            fourcc = cv2.VideoWriter_fourcc(*self.codec)
-            self.writer = cv2.VideoWriter(self.output_path, fourcc, self.fps, (width, height))
-
-            if not self.writer.isOpened():
-                self.signals.error_occurred.emit("Failed to create video file. Check codec settings.")
-                return
-
-            self.state = RecordingState.RECORDING
-            self.start_time = time.time()
-            self._pause_event.set()
-
-            frame_interval = 1.0 / self.fps
-
-            while not self._stop_event.is_set():
-                self._pause_event.wait()
-                if self._stop_event.is_set():
-                    break
-
-                frame_start = time.time()
-                
-                try:
-                    img = self.sct.grab(monitor)
-                    frame = np.array(img)
-                    frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-                    self.writer.write(frame)
-                    self.frame_count += 1
-                except Exception as e:
-                    self.signals.error_occurred.emit(f"Frame capture error: {str(e)}")
-                    break
-
-                elapsed = time.time() - self.start_time
-                h = int(elapsed // 3600)
-                m = int((elapsed % 3600) // 60)
-                s = int(elapsed % 60)
-                self.signals.update_timer.emit(f"{h:02d}:{m:02d}:{s:02d}")
-
-                frame_time = time.time() - frame_start
-                sleep_time = max(0, frame_interval - frame_time)
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-
-        except Exception as e:
-            self.signals.error_occurred.emit(f"Recording error: {str(e)}")
-        finally:
-            if self.writer:
-                self.writer.release()
-                self.writer = None
-            if self.sct:
-                self.sct.close()
-                self.sct = None
-            
-            if self.state != RecordingState.IDLE and self.output_path:
-                self.signals.recording_finished.emit(self.output_path)
-            self.state = RecordingState.IDLE
-
-
-class ModernButton(QPushButton):
-    """Styled modern button"""
-    def __init__(self, text, color="#00aeff", parent=None):
-        super().__init__(text, parent)
-        self.setMinimumHeight(45)
-        self.setMinimumWidth(120)
-        self.setFont(QFont("Segoe UI", 11, QFont.Bold))
-        self.setCursor(Qt.PointingHandCursor)
-        self.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {color};
-                color: white;
-                border: none;
-                border-radius: 8px;
-                padding: 8px 20px;
-                font-weight: bold;
-            }}
-            QPushButton:hover {{
-                background-color: {color}dd;
-            }}
-            QPushButton:pressed {{
-                background-color: {color}aa;
-            }}
-            QPushButton:disabled {{
-                background-color: #555;
-                color: #999;
-            }}
-        """)
-
-
-class ScreenRecorderWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
-        self.setMinimumSize(520, 620)
-        self.setFixedSize(520, 620)
-        
-        self.signals = RecorderSignals()
-        self.engine = ScreenRecorderEngine(self.signals)
-        self.region_selector = RegionSelector()
-        self.settings = QSettings("ScreenRecorder", "ScreenRecorder")
-        
-        self.selected_region = None
-        self.selected_region_name = "Full Screen"
-        self.hotkey_listener = None
-        
-        self._connect_signals()
-        self._init_ui()
-        self._init_tray()
-        self._init_hotkeys()
-        self._load_settings()
-        
-        self.center_window()
-
-    def center_window(self):
-        screen = QApplication.primaryScreen().geometry()
-        size = self.geometry()
-        self.move(
-            (screen.width() - size.width()) // 2,
-            (screen.height() - size.height()) // 2
-        )
-
-    def _connect_signals(self):
-        self.signals.update_timer.connect(self._on_timer_update)
-        self.signals.recording_finished.connect(self._on_recording_finished)
-        self.signals.error_occurred.connect(self._on_error)
-        self.region_selector.region_selected.connect(self._on_region_selected)
-        self.region_selector.cancelled.connect(self._on_region_cancelled)
-
-    def _init_ui(self):
-        central = QWidget()
-        self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
-        layout.setSpacing(10)
-        layout.setContentsMargins(20, 15, 20, 15)
-
-        # Title
-        title = QLabel(f"🎬 {APP_NAME}")
-        title.setFont(QFont("Segoe UI", 20, QFont.Bold))
-        title.setAlignment(Qt.AlignCenter)
-        title.setStyleSheet("color: #ffffff; margin-bottom: 5px;")
-        layout.addWidget(title)
-
-        version_label = QLabel(f"v{APP_VERSION} • Windows 7-11")
-        version_label.setAlignment(Qt.AlignCenter)
-        version_label.setStyleSheet("color: #888; font-size: 11px; margin-bottom: 10px;")
-        layout.addWidget(version_label)
-
-        # Timer display
-        self.timer_label = QLabel("00:00:00")
-        self.timer_label.setFont(QFont("Consolas", 32, QFont.Bold))
-        self.timer_label.setAlignment(Qt.AlignCenter)
-        self.timer_label.setStyleSheet("color: #00aeff; background: #1a1a2e; border-radius: 12px; padding: 15px;")
-        layout.addWidget(self.timer_label)
-
-        # Status
-        self.status_label = QLabel("● Ready")
-        self.status_label.setAlignment(Qt.AlignCenter)
-        self.status_label.setFont(QFont("Segoe UI", 10))
-        self.status_label.setStyleSheet("color: #4CAF50; margin: 5px;")
-        layout.addWidget(self.status_label)
-
-        # Settings group
-        settings_group = QGroupBox("⚙ Settings")
-        settings_group.setFont(QFont("Segoe UI", 10, QFont.Bold))
-        settings_group.setStyleSheet("""
-            QGroupBox {
-                border: 1px solid #333;
-                border-radius: 8px;
-                margin-top: 10px;
-                padding-top: 15px;
-                color: #ccc;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 15px;
-                padding: 0 5px;
-            }
-        """)
-        settings_layout = QVBoxLayout(settings_group)
-
-        # Region selection
-        region_row = QHBoxLayout()
-        region_row.addWidget(QLabel("Capture Area:"))
-        self.region_combo = QComboBox()
-        self.region_combo.addItems(["Full Screen", "Custom Region", "Primary Monitor"])
-        self.region_combo.currentIndexChanged.connect(self._on_region_changed)
-        self.region_combo.setStyleSheet("QComboBox { padding: 6px; border-radius: 5px; }")
-        region_row.addWidget(self.region_combo)
-        settings_layout.addLayout(region_row)
-
-        # FPS
-        fps_row = QHBoxLayout()
-        fps_row.addWidget(QLabel("Frame Rate:"))
-        self.fps_spin = QSpinBox()
-        self.fps_spin.setRange(10, 120)
-        self.fps_spin.setValue(DEFAULT_FPS)
-        self.fps_spin.setSuffix(" FPS")
-        self.fps_spin.setStyleSheet("QSpinBox { padding: 6px; border-radius: 5px; }")
-        fps_row.addWidget(self.fps_spin)
-        settings_layout.addLayout(fps_row)
-
-        # Quality slider
-        quality_row = QHBoxLayout()
-        quality_row.addWidget(QLabel("Quality:"))
-        self.quality_slider = QSlider(Qt.Horizontal)
-        self.quality_slider.setRange(10, 100)
-        self.quality_slider.setValue(DEFAULT_QUALITY)
-        self.quality_slider.valueChanged.connect(self._on_quality_change)
-        quality_row.addWidget(self.quality_slider)
-        self.quality_label = QLabel(f"{DEFAULT_QUALITY}%")
-        self.quality_label.setMinimumWidth(40)
-        quality_row.addWidget(self.quality_label)
-        settings_layout.addLayout(quality_row)
-
-        # Codec
-        codec_row = QHBoxLayout()
-        codec_row.addWidget(QLabel("Format:"))
-        self.codec_combo = QComboBox()
-        self.codec_combo.addItems(["MP4 (mp4v)", "AVI (XVID)", "MKV (X264)"])
-        self.codec_combo.setStyleSheet("QComboBox { padding: 6px; border-radius: 5px; }")
-        codec_row.addWidget(self.codec_combo)
-        settings_layout.addLayout(codec_row)
-
-        layout.addWidget(settings_group)
-
-        # Hotkey info
-        hotkey_label = QLabel("⌨ Hotkeys: F9 = Start/Stop  •  F10 = Pause/Resume  •  F11 = Screenshot")
-        hotkey_label.setAlignment(Qt.AlignCenter)
-        hotkey_label.setStyleSheet("color: #888; font-size: 10px; padding: 5px;")
-        layout.addWidget(hotkey_label)
-
-        # Control buttons
-        btn_layout = QHBoxLayout()
-        btn_layout.setSpacing(12)
-
-        self.record_btn = ModernButton("⏺ Record", "#e74c3c")
-        self.record_btn.clicked.connect(self._toggle_recording)
-        btn_layout.addWidget(self.record_btn)
-
-        self.pause_btn = ModernButton("⏸ Pause", "#f39c12")
-        self.pause_btn.setEnabled(False)
-        self.pause_btn.clicked.connect(self._toggle_pause)
-        btn_layout.addWidget(self.pause_btn)
-
-        self.screenshot_btn = ModernButton("📷 Screenshot", "#2ecc71")
-        self.screenshot_btn.clicked.connect(self._take_screenshot)
-        btn_layout.addWidget(self.screenshot_btn)
-
-        layout.addLayout(btn_layout)
-
-        # Output folder
-        folder_row = QHBoxLayout()
-        folder_row.addWidget(QLabel("📁 Output:"))
-        self.folder_label = QLabel(DEFAULT_OUTPUT_DIR)
-        self.folder_label.setStyleSheet("color: #aaa; font-size: 10px;")
-        self.folder_label.setWordWrap(True)
-        folder_row.addWidget(self.folder_label, 1)
-        browse_btn = QPushButton("Browse")
-        browse_btn.clicked.connect(self._browse_folder)
-        browse_btn.setStyleSheet("QPushButton { padding: 5px 12px; border-radius: 5px; }")
-        folder_row.addWidget(browse_btn)
-        layout.addLayout(folder_row)
-
-        # System tray checkbox
-        self.tray_check = QCheckBox("Minimize to system tray")
-        self.tray_check.setChecked(True)
-        self.tray_check.setStyleSheet("color: #aaa;")
-        layout.addWidget(self.tray_check)
-
-        # Apply dark theme
-        self.setStyleSheet("""
-            QMainWindow { background-color: #0d1117; }
-            QWidget { background-color: #0d1117; color: #e6e6e6; }
-            QComboBox, QSpinBox {
-                background-color: #161b22;
-                color: #e6e6e6;
-                border: 1px solid #333;
-                padding: 5px;
-            }
-            QComboBox:hover, QSpinBox:hover {
-                border: 1px solid #00aeff;
-            }
-            QSlider::groove:horizontal {
-                height: 6px;
-                background: #333;
-                border-radius: 3px;
-            }
-            QSlider::handle:horizontal {
-                background: #00aeff;
-                width: 16px;
-                height: 16px;
-                margin: -5px 0;
-                border-radius: 8px;
-            }
-            QGroupBox { color: #ccc; }
-            QCheckBox { color: #aaa; }
-            QCheckBox::indicator {
-                width: 16px; height: 16px;
-                border-radius: 3px;
-                border: 2px solid #555;
-                background: #161b22;
-            }
-            QCheckBox::indicator:checked {
-                background: #00aeff;
-                border-color: #00aeff;
-            }
-        """)
-
-    def _init_tray(self):
-        self.tray = QSystemTrayIcon(self)
-        self.tray_icon = self._create_tray_icon()
-        self.tray.setIcon(self.tray_icon)
-        self.tray.setToolTip(APP_NAME)
-        
-        tray_menu = QMenu()
-        show_action = tray_menu.addAction("Show")
-        show_action.triggered.connect(self._show_window)
-        stop_action = tray_menu.addAction("Stop Recording")
-        stop_action.triggered.connect(self._stop_recording)
-        tray_menu.addSeparator()
-        quit_action = tray_menu.addAction("Quit")
-        quit_action.triggered.connect(self._quit_app)
-        self.tray.setContextMenu(tray_menu)
-        self.tray.activated.connect(self._on_tray_activated)
-        self.tray.show()
-
-    def _create_tray_icon(self):
-        pixmap = QPixmap(32, 32)
-        pixmap.fill(QColor(0, 174, 255))
-        painter = QPainter(pixmap)
-        painter.setPen(QPen(QColor(255, 255, 255), 2))
-        painter.drawEllipse(8, 8, 16, 16)
-        painter.setBrush(QColor(255, 255, 255))
-        painter.drawEllipse(13, 13, 6, 6)
-        painter.end()
-        return QIcon(pixmap)
-
-    def _init_hotkeys(self):
-        if not PYNPUT_AVAILABLE:
-            return
-        
-        def on_press(key):
-            try:
-                if key == pynput_keyboard.Key.f9:
-                    self._toggle_recording()
-                elif key == pynput_keyboard.Key.f10:
-                    self._toggle_pause()
-                elif key == pynput_keyboard.Key.f11:
-                    self._take_screenshot()
-            except Exception:
-                pass
-
-        try:
-            self.hotkey_listener = pynput_keyboard.Listener(on_press=on_press)
-            self.hotkey_listener.daemon = True
-            self.hotkey_listener.start()
-        except Exception:
-            pass
-
-    def _load_settings(self):
-        try:
-            if os.path.exists(CONFIG_FILE):
-                with open(CONFIG_FILE, 'r') as f:
-                    config = json.load(f)
-                self.fps_spin.setValue(config.get('fps', DEFAULT_FPS))
-                self.quality_slider.setValue(config.get('quality', DEFAULT_QUALITY))
-                self.codec_combo.setCurrentIndex(config.get('codec_index', 0))
-                self.folder_label.setText(config.get('output_dir', DEFAULT_OUTPUT_DIR))
-        except Exception:
-            pass
-
-    def _save_settings(self):
-        config = {
-            'fps': self.fps_spin.value(),
-            'quality': self.quality_slider.value(),
-            'codec_index': self.codec_combo.currentIndex(),
-            'output_dir': self.folder_label.text()
-        }
-        try:
-            with open(CONFIG_FILE, 'w') as f:
-                json.dump(config, f)
-        except Exception:
-            pass
-
-    def _get_codec_settings(self):
-        idx = self.codec_combo.currentIndex()
-        if idx == 0:
-            return 'mp4v', '.mp4'
-        elif idx == 1:
-            return 'XVID', '.avi'
-        else:
-            return 'X264', '.mk4'
-
-    def _generate_filename(self):
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        _, ext = self._get_codec_settings()
-        return os.path.join(self.folder_label.text(), f"recording_{timestamp}{ext}")
-
-    def _on_quality_change(self, value):
-        self.quality_label.setText(f"{value}%")
-
-    def _on_region_changed(self, index):
-        if index == 1:  # Custom Region
-            self.region_selector.region_selected.connect(self._on_region_selected, Qt.UniqueConnection)
-            self.region_selector.start_selection()
-
-    def _on_region_selected(self, x, y, w, h):
-        self.selected_region = (x, y, w, h)
-        self.selected_region_name = f"Region ({w}x{h})"
-        self.status_label.setText(f"● Region selected: {w}x{h} at ({x},{y})")
-
-    def _on_region_cancelled(self):
-        self.region_combo.setCurrentIndex(0)
-        self.selected_region = None
-        self.selected_region_name = "Full Screen"
-
-    def _toggle_recording(self):
-        if self.engine.state == RecordingState.IDLE:
-            self._start_recording()
-        else:
-            self._stop_recording()
-
-    def _start_recording(self):
-        output = self._generate_filename()
-        codec, _ = self._get_codec_settings()
-        region = self.selected_region
-        
-        if self.region_combo.currentIndex() == 0:
-            region = None  # Full screen
-        elif self.region_combo.currentIndex() == 2:
-            region = None  # Primary monitor (handled by mss)
-
-        success = self.engine.start(
-            output_path=output,
-            region=region,
-            fps=self.fps_spin.value(),
-            quality=self.quality_slider.value(),
-            codec=codec
-        )
-
-        if success:
-            self.record_btn.setText("⏹ Stop")
-            self.record_btn.setStyleSheet("""
-                QPushButton {
-                    background-color: #555;
-                    color: white;
-                    border: none;
-                    border-radius: 8px;
-                    padding: 8px 20px;
-                    font-weight: bold;
-                    font-size: 11pt;
-                }
-            """)
-            self.pause_btn.setEnabled(True)
-            self.status_label.setText("● Recording...")
-            self.status_label.setStyleSheet("color: #e74c3c; margin: 5px; font-weight: bold;")
-            self.setWindowOpacity(0.9)
-            
-            for combo in [self.region_combo, self.fps_spin, self.codec_combo]:
-                combo.setEnabled(False)
-            self.quality_slider.setEnabled(False)
-
-    def _stop_recording(self):
-        self.engine.stop()
-        self.record_btn.setText("⏺ Record")
-        self.record_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #e74c3c;
-                color: white;
-                border: none;
-                border-radius: 8px;
-                padding: 8px 20px;
-                font-weight: bold;
-                font-size: 11pt;
-            }
-            QPushButton:hover { background-color: #c0392b; }
-            QPushButton:disabled { background-color: #555; color: #999; }
-        """)
-        self.pause_btn.setEnabled(False)
-        self.pause_btn.setText("⏸ Pause")
-        self.status_label.setText("● Processing...")
-        self.status_label.setStyleSheet("color: #f39c12; margin: 5px;")
-        self.setWindowOpacity(1.0)
-
-        for combo in [self.region_combo, self.fps_spin, self.codec_combo]:
-            combo.setEnabled(True)
-        self.quality_slider.setEnabled(True)
-
-    def _toggle_pause(self):
-        if self.engine.state == RecordingState.RECORDING:
-            self.engine.pause()
-            self.pause_btn.setText("▶ Resume")
-            self.status_label.setText("● Paused")
-            self.status_label.setStyleSheet("color: #f39c12; margin: 5px;")
-        elif self.engine.state == RecordingState.PAUSED:
-            self.engine.resume()
-            self.pause_btn.setText("⏸ Pause")
-            self.status_label.setText("● Recording...")
-            self.status_label.setStyleSheet("color: #e74c3c; margin: 5px; font-weight: bold;")
-
-    def _take_screenshot(self):
-        try:
-            if not MSS_AVAILABLE:
-                QMessageBox.warning(self, "Error", "mss library not available!")
-                return
-            
-            with mss.mss() as sct:
-                if self.selected_region:
-                    monitor = {
-                        "left": self.selected_region[0],
-                        "top": self.selected_region[1],
-                        "width": self.selected_region[2],
-                        "height": self.selected_region[3]
-                    }
-                else:
-                    monitor = sct.monitors[1]
-                
-                img = sct.grab(monitor)
-                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                path = os.path.join(self.folder_label.text(), f"screenshot_{timestamp}.png")
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                mss.tools.to_png(img.rgb, img.size, output=path)
-                
-                self.tray.showMessage("Screenshot Saved", path, QSystemTrayIcon.Information, 2000)
-        except Exception as e:
-            QMessageBox.warning(self, "Error", f"Screenshot failed: {str(e)}")
-
-    def _browse_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select Output Folder", self.folder_label.text())
-        if folder:
-            self.folder_label.setText(folder)
-
-    def _on_timer_update(self, time_str):
-        self.timer_label.setText(time_str)
-
-    def _on_recording_finished(self, path):
-        self.status_label.setText("● Ready")
-        self.status_label.setStyleSheet("color: #4CAF50; margin: 5px;")
-        self.timer_label.setText("00:00:00")
-        self.tray.showMessage(
-            "Recording Saved",
-            f"File: {path}\nFrames: {self.engine.frame_count}",
-            QSystemTrayIcon.Information, 3000
-        )
-
-    def _on_error(self, msg):
-        self.status_label.setText(f"● Error: {msg}")
-        self.status_label.setStyleSheet("color: #e74c3c; margin: 5px;")
-        QMessageBox.critical(self, "Recording Error", msg)
-        self._stop_recording()
-
-    def _on_tray_activated(self, reason):
-        if reason == QSystemTrayIcon.DoubleClick:
-            self._show_window()
-
-    def _show_window(self):
-        self.showNormal()
-        self.activateWindow()
-        self.raise_()
-
-    def closeEvent(self, event):
-        if self.engine.state != RecordingState.IDLE:
-            reply = QMessageBox.question(
-                self, "Recording Active",
-                "Recording is in progress. Stop and quit?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
-            )
-            if reply == QMessageBox.Yes:
-                self._stop_recording()
-                event.accept()
-            else:
-                event.ignore()
-        else:
-            self._save_settings()
-            event.accept()
-
-    def _quit_app(self):
-        if self.engine.state != RecordingState.IDLE:
-            self.engine.stop()
-        self._save_settings()
-        QApplication.quit()
-
-    def changeEvent(self, event):
-        if event.type() == event.WindowStateChange:
-            if self.isMinimized() and self.tray_check.isChecked():
-                self.hide()
-                self.tray.showMessage(
-                    APP_NAME,
-                    "Minimized to system tray. Double-click to restore.",
-                    QSystemTrayIcon.Information, 1500
-                )
-
-
 def main():
-    if not PYQT5:
-        print("ERROR: PyQt5 is required. Install with: pip install PyQt5")
+    if not HAS_PYQT5:
+        print("ERROR: PyQt5 required. pip install PyQt5")
         sys.exit(1)
-    
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(APP_VERSION)
     app.setQuitOnLastWindowClosed(False)
-    
-    window = ScreenRecorderWindow()
-    window.show()
-    
+    w = MainWindow()
+    w.show()
     sys.exit(app.exec_())
 
 
