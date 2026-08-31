@@ -128,6 +128,17 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             startActivity(Intent(this, RecordingGalleryActivity::class.java))
         }
 
+        // Developer links
+        findViewById<View>(R.id.btnTelegram).setOnClickListener {
+            startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse("https://t.me/AnishtayiN")))
+        }
+        findViewById<View>(R.id.btnGitHub).setOnClickListener {
+            startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse("https://github.com/AnishtayiN")))
+        }
+        findViewById<com.google.android.material.button.MaterialButton>(R.id.btnStar).setOnClickListener {
+            startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse("https://github.com/AnishtayiN/ScreenRecorder")))
+        }
+
         // Set initial states
         btnPause.isEnabled = false
         btnStop.isEnabled = false
