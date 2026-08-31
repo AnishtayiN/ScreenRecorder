@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="wrap_content"
+    android:layout_height="wrap_content"
+    android:orientation="horizontal"
+    android:background="@drawable/bg_floating_overlay"
+    android:padding="8dp"
+    android:gravity="center_vertical"
+    android:elevation="12dp">
+
+    <!-- Recording Dot -->
+    <View
+        android:id="@+id/floatingDot"
+        android:layout_width="12dp"
+        android:layout_height="12dp"
+        android:background="@drawable/bg_pulse"
+        android:layout_marginEnd="8dp" />
+
+    <!-- Timer -->
+    <TextView
+        android:id="@+id/tvFloatingTimer"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="00:00"
+        android:textSize="14sp"
+        android:textStyle="bold"
+        android:textColor="@color/text_primary"
+        android:fontFamily="monospace"
+        android:layout_marginEnd="12dp" />
+
+    <!-- Pause Button -->
+    <TextView
+        android:id="@+id/btnFloatingPause"
+        android:layout_width="36dp"
+        android:layout_height="36dp"
+        android:text="⏸"
+        android:textSize="16sp"
+        android:gravity="center"
+        android:textColor="@color/status_paused"
+        android:background="?android:attr/selectableItemBackgroundBorderless"
+        android:clickable="true"
+        android:focusable="true"
+        android:layout_marginEnd="4dp" />
+
+    <!-- Stop Button -->
+    <TextView
+        android:id="@+id/btnFloatingStop"
+        android:layout_width="36dp"
+        android:layout_height="36dp"
+        android:text="⏹"
+        android:textSize="16sp"
+        android:gravity="center"
+        android:textColor="@color/status_recording"
+        android:background="?android:attr/selectableItemBackgroundBorderless"
+        android:clickable="true"
+        android:focusable="true" />
+</LinearLayout>

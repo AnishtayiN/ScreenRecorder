@@ -1,16 +1,29 @@
-<?xml version="1.0" encoding="utf-8"?>
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
+    <!-- Screen frame -->
     <path
         android:fillColor="#FFFFFF"
-        android:pathData="M40,35 L68,35 C70,35 72,37 72,39 L72,69 C72,71 70,73 68,73 L40,73 C38,73 36,71 36,69 L36,39 C36,37 38,35 40,35 Z"/>
+        android:pathData="M30,28 L78,28 C79.1,28 80,28.9 80,30 L80,72 C80,73.1 79.1,74 78,74 L30,74 C28.9,74 28,73.1 28,72 L28,30 C28,28.9 28.9,28 30,28 Z"/>
+    <!-- Screen area -->
+    <path
+        android:fillColor="#0f3460"
+        android:pathData="M32,32 L76,32 L76,68 L32,68 Z"/>
+    <!-- Record button circle -->
     <path
         android:fillColor="#e74c3c"
-        android:pathData="M47,50 m-8,0 a8,8 0 1,1 16,0 a8,8 0 1,1 -16,0"/>
+        android:pathData="M54,50 m-10,0 a10,10 0 1,1 20,0 a10,10 0 1,1 -20,0"/>
+    <!-- Play triangle -->
     <path
         android:fillColor="#FFFFFF"
-        android:pathData="M73,42 L78,37 C79,36 80,36 80,37 L80,71 C80,72 79,72 78,71 L73,66 Z"/>
+        android:pathData="M50,45 L50,55 L59,50 Z"/>
+    <!-- Stand -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M44,74 L64,74 L62,78 L46,78 Z"/>
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M40,78 L68,78 L68,80 L40,80 Z"/>
 </vector>
