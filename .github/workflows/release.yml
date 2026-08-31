@@ -5,6 +5,16 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version number (e.g. 1.2.0)'
+        required: true
+        type: string
+      prerelease:
+        description: 'Is this a pre-release?'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -27,6 +37,17 @@ jobs:
           cd windows
           pip install -r requirements.txt
           pip install pyinstaller
+
+      - name: Update version in source
+        shell: pwsh
+        run: |
+          $ver = "${{ inputs.version || github.ref_name }}"
+          if ($ver.StartsWith('v')) { $ver = $ver.Substring(1) }
+          $file = "windows/screen_recorder.py"
+          $content = Get-Content $file -Raw
+          $content = $content -replace 'APP_VERSION = ".*"', "APP_VERSION = `"$ver`""
+          Set-Content $file $content
+          Write-Host "Version set to $ver"
 
       - name: Build EXE
         run: |
@@ -62,6 +83,18 @@ jobs:
         run: |
           sdkmanager "platforms;android-34" "build-tools;34.0.0"
 
+      - name: Update version in build.gradle
+        run: |
+          VER="${{ inputs.version || github.ref_name }}"
+          VER="${VER#v}"
+          MAJOR=$(echo $VER | cut -d. -f1)
+          MINOR=$(echo $VER | cut -d. -f2)
+          PATCH=$(echo $VER | cut -d. -f3)
+          VERSION_CODE=$((MAJOR * 10000 + MINOR * 100 + PATCH))
+          sed -i "s/versionName \".*\"/versionName \"$VER\"/" android/app/build.gradle
+          sed -i "s/versionCode [0-9]*/versionCode $VERSION_CODE/" android/app/build.gradle
+          echo "Version set to $VER (code: $VERSION_CODE)"
+
       - name: Grant execute permission for gradlew
         run: chmod +x android/gradlew
 
@@ -73,7 +106,7 @@ jobs:
         working-directory: android
         run: ./gradlew assembleRelease
 
-      - name: Upload Android artifact
+      - name: Upload Android Debug artifact
         uses: actions/upload-artifact@v4
         with:
           name: android-apk
@@ -89,8 +122,21 @@ jobs:
     name: Create GitHub Release
     needs: [build-windows, build-android]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
+    if: always() && (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch')
     steps:
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=v${{ inputs.version }}" >> $GITHUB_OUTPUT
+            echo "name=v${{ inputs.version }}" >> $GITHUB_OUTPUT
+            echo "prerelease=${{ inputs.prerelease }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+            echo "name=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+            echo "prerelease=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Download Windows EXE
         uses: actions/download-artifact@v4
         with:
@@ -103,12 +149,19 @@ jobs:
           name: android-apk
           path: artifacts/android
 
+      - name: Download Android Release APK
+        uses: actions/download-artifact@v4
+        with:
+          name: android-apk-release
+          path: artifacts/android-release
+
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          name: "Screen Recorder ${{ github.ref_name }}"
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "🎬 Screen Recorder ${{ steps.version.outputs.name }}"
           body: |
-            ## 🎬 Screen Recorder ${{ github.ref_name }}
+            ## 🎬 Screen Recorder ${{ steps.version.outputs.name }}
             
             ### 🪟 Windows (7 - 11)
             - Download `ScreenRecorder.exe`
@@ -116,27 +169,29 @@ jobs:
             - Requirements: Windows 7 or later
             
             ### 📱 Android (7.0+)
-            - Download `app-debug.apk`
+            - Download `app-debug.apk` (Debug — easier to install)
+            - Download `app-release-unsigned.apk` (Release — needs signing)
             - Enable "Install from Unknown Sources" in settings
             - Requires Android 7.0 (API 24) or later
             
-            ### Features
+            ### ✨ Features
             - 🎥 Full screen & custom region recording
             - ⏸ Pause/Resume functionality
             - 📷 Screenshot capture (Windows)
             - ⌨ Global hotkeys (F9/F10/F11)
             - 🎚 FPS, quality & format settings
             - 🔔 System tray support (Windows)
-            - 📱 Floating notification controls (Android)
+            - 📱 Notification controls (Android)
             
-            ### Hotkeys (Windows)
-            - **F9** — Start/Stop recording
-            - **F10** — Pause/Resume
+            ### ⌨ Hotkeys (Windows)
+            - **F9** — Start / Stop recording
+            - **F10** — Pause / Resume
             - **F11** — Take screenshot
           files: |
             artifacts/windows/ScreenRecorder.exe
             artifacts/android/app-debug.apk
+            artifacts/android-release/app-release-unsigned.apk
           draft: false
-          prerelease: false
+          prerelease: ${{ steps.version.outputs.prerelease == 'true' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
