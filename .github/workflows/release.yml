@@ -52,7 +52,7 @@ jobs:
       - name: Build EXE
         run: |
           cd windows
-          pyinstaller --onefile --noconsole --name ScreenRecorder --icon=NUL screen_recorder.py
+          pyinstaller --onefile --noconsole --name ScreenRecorder screen_recorder.py
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
@@ -83,6 +83,9 @@ jobs:
         run: |
           sdkmanager "platforms;android-34" "build-tools;34.0.0"
 
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
       - name: Update version in build.gradle
         run: |
           VER="${{ inputs.version || github.ref_name }}"
@@ -95,16 +98,13 @@ jobs:
           sed -i "s/versionCode [0-9]*/versionCode $VERSION_CODE/" android/app/build.gradle
           echo "Version set to $VER (code: $VERSION_CODE)"
 
-      - name: Grant execute permission for gradlew
-        run: chmod +x android/gradlew
-
       - name: Build Debug APK
         working-directory: android
-        run: ./gradlew assembleDebug
+        run: gradle assembleDebug
 
       - name: Build Release APK
         working-directory: android
-        run: ./gradlew assembleRelease
+        run: gradle assembleRelease
 
       - name: Upload Android Debug artifact
         uses: actions/upload-artifact@v4
@@ -124,6 +124,9 @@ jobs:
     runs-on: ubuntu-latest
     if: always() && (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch')
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Determine version
         id: version
         run: |
@@ -159,34 +162,33 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ steps.version.outputs.tag }}
-          name: "🎬 Screen Recorder ${{ steps.version.outputs.name }}"
+          name: "Screen Recorder ${{ steps.version.outputs.name }}"
           body: |
-            ## 🎬 Screen Recorder ${{ steps.version.outputs.name }}
+            ## Screen Recorder ${{ steps.version.outputs.name }}
             
-            ### 🪟 Windows (7 - 11)
+            ### Windows (7 - 11)
             - Download `ScreenRecorder.exe`
             - No installation needed, just run it
             - Requirements: Windows 7 or later
             
-            ### 📱 Android (7.0+)
-            - Download `app-debug.apk` (Debug — easier to install)
-            - Download `app-release-unsigned.apk` (Release — needs signing)
+            ### Android (7.0+)
+            - Download `app-debug.apk` (Debug - easier to install)
             - Enable "Install from Unknown Sources" in settings
             - Requires Android 7.0 (API 24) or later
             
-            ### ✨ Features
-            - 🎥 Full screen & custom region recording
-            - ⏸ Pause/Resume functionality
-            - 📷 Screenshot capture (Windows)
-            - ⌨ Global hotkeys (F9/F10/F11)
-            - 🎚 FPS, quality & format settings
-            - 🔔 System tray support (Windows)
-            - 📱 Notification controls (Android)
+            ### Features
+            - Full screen and custom region recording
+            - Pause/Resume functionality
+            - Screenshot capture (Windows)
+            - Global hotkeys (F9/F10/F11)
+            - FPS, quality and format settings
+            - System tray support (Windows)
+            - Notification controls (Android)
             
-            ### ⌨ Hotkeys (Windows)
-            - **F9** — Start / Stop recording
-            - **F10** — Pause / Resume
-            - **F11** — Take screenshot
+            ### Hotkeys (Windows)
+            - **F9** - Start / Stop recording
+            - **F10** - Pause / Resume
+            - **F11** - Take screenshot
           files: |
             artifacts/windows/ScreenRecorder.exe
             artifacts/android/app-debug.apk
