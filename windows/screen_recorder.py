@@ -1,11 +1,10 @@
 """
 Screen Recorder Pro v2.0 - Windows
-Webcam PiP, Audio Recording, Drawing Tools, Multi-Monitor, GIF Export
+Countdown, Floating Controls, Webcam PiP, Drawing Tools, GIF Export, Multi-Monitor
 """
 
-import sys, os, time, threading, datetime, json, struct, wave
+import sys, os, time, threading, datetime, json, wave, math
 from pathlib import Path
-from collections import deque
 
 try:
     from PyQt5.QtWidgets import (
@@ -13,12 +12,13 @@ try:
         QPushButton, QLabel, QComboBox, QCheckBox, QFileDialog,
         QSystemTrayIcon, QMenu, QMessageBox, QGroupBox, QSlider,
         QSpinBox, QFrame, QTabWidget, QListWidget, QListWidgetItem,
-        QColorDialog, QSplitter, QToolButton, QButtonGroup, QStatusBar
+        QColorDialog, QSplitter, QToolButton, QButtonGroup, QStatusBar,
+        QGraphicsDropShadowEffect, QInputDialog
     )
-    from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QRect, QThread
+    from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QRect, QThread, QPoint, QPropertyAnimation, QEasingCurve
     from PyQt5.QtGui import (
         QIcon, QPixmap, QPainter, QColor, QFont, QKeySequence, QPen,
-        QBrush, QRadialGradient, QFontMetrics
+        QBrush, QRadialGradient, QFontMetrics, QCursor, QRegion, QPalette
     )
     HAS_PYQT5 = True
 except ImportError:
@@ -66,6 +66,7 @@ class EngineSignals(QObject):
     finished = pyqtSignal(str)
     error = pyqtSignal(str)
     frame_ready = pyqtSignal(object)
+    countdown_tick = pyqtSignal(int)
 
 
 class RecordingEngine:
@@ -78,27 +79,25 @@ class RecordingEngine:
         self.frame_count = 0
         self.start_time = 0
         self.output_path = ""
-        # settings
         self.region = None
         self.monitor_index = 1
         self.fps = 30
         self.codec = "mp4v"
         self.ext = ".mp4"
         self.quality = 80
-        # audio
         self.audio_enabled = False
         self.audio_device_index = None
         self._audio_stream = None
         self._audio_frames = []
         self._audio_thread = None
-        # webcam
         self.webcam_enabled = False
         self.webcam_index = 0
         self.webcam_pos = "bottom-right"
         self.webcam_scale = 0.25
         self._cap = None
-        # draw
         self.draw_overlay = None
+        self.cursor_highlight = False
+        self.cursor_radius = 20
 
     def start(self, path):
         if self.state != RecordingState.IDLE:
@@ -150,8 +149,6 @@ class RecordingEngine:
                         pass
             self._audio_stream.stop_stream()
             self._audio_stream.close()
-            pa.terminate()
-            # save wav
             wav_path = self.output_path.rsplit(".", 1)[0] + "_audio.wav"
             wf = wave.open(wav_path, "wb")
             wf.setnchannels(1)
@@ -161,6 +158,25 @@ class RecordingEngine:
             wf.close()
         except Exception as e:
             self.sig.error.emit(f"Audio error: {e}")
+
+    def _get_cursor_pos(self):
+        try:
+            pos = QCursor.pos()
+            return int(pos.x()), int(pos.y())
+        except Exception:
+            return -1, -1
+
+    def _draw_cursor_highlight(self, frame, cx, cy, sx, sy):
+        if not self.cursor_highlight or cx < 0:
+            return
+        fx = int(cx * sx)
+        fy = int(cy * sy)
+        r = self.cursor_radius
+        overlay = frame.copy()
+        cv2.circle(overlay, (fx, fy), r, (0, 174, 255), -1)
+        cv2.addWeighted(overlay, 0.3, frame, 0.7, 0, frame)
+        cv2.circle(frame, (fx, fy), r, (0, 174, 255), 2)
+        cv2.circle(frame, (fx, fy), 4, (255, 255, 255), -1)
 
     def _loop(self):
         try:
@@ -189,7 +205,6 @@ class RecordingEngine:
                 self.sig.error.emit("Cannot open video writer. Try another codec.")
                 return
 
-            # webcam capture
             cam = None
             if self.webcam_enabled and HAS_CV2:
                 try:
@@ -214,9 +229,15 @@ class RecordingEngine:
                     img = sct.grab(monitor)
                     frame = np.array(img)
                     frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-                    # resize to writer size
                     if frame.shape[1] != w or frame.shape[0] != h:
                         frame = cv2.resize(frame, (w, h))
+
+                    # cursor highlight
+                    if self.cursor_highlight:
+                        cx, cy = self._get_cursor_pos()
+                        sx = w / monitor.get("width", w)
+                        sy = h / monitor.get("height", h)
+                        self._draw_cursor_highlight(frame, cx, cy, sx, sy)
 
                     # webcam PiP overlay
                     if cam and cam.isOpened():
@@ -225,7 +246,6 @@ class RecordingEngine:
                             cw = int(w * self.webcam_scale)
                             ch = int(cw * cam_frame.shape[0] / cam_frame.shape[1])
                             cam_small = cv2.resize(cam_frame, (cw, ch))
-                            # position
                             margin = 15
                             if self.webcam_pos == "top-left":
                                 px, py = margin, margin
@@ -237,7 +257,6 @@ class RecordingEngine:
                                 px, py = w - cw - margin, h - ch - margin
                             px = max(0, min(px, w - cw))
                             py = max(0, min(py, h - ch))
-                            # rounded rect mask
                             mask = np.zeros((ch, cw), dtype=np.uint8)
                             cv2.rectangle(mask, (4, 4), (cw - 4, ch - 4), 255, -1)
                             roi = frame[py:py + ch, px:px + cw]
@@ -246,15 +265,13 @@ class RecordingEngine:
                                 mask_inv = cv2.bitwise_not(mask)
                                 bg = cv2.bitwise_and(roi, roi, mask=mask_inv)
                                 frame[py:py + ch, px:px + cw] = cv2.add(masked, bg)
-                                # border
                                 cv2.rectangle(frame, (px + 2, py + 2), (px + cw - 2, py + ch - 2), (0, 174, 255), 2)
 
                     # draw overlay
                     if self.draw_overlay and self.draw_overlay.drawing_visible:
                         overlay = self.draw_overlay.get_overlay_frame(w, h)
                         if overlay is not None:
-                            combined = cv2.add(frame, overlay)
-                            frame = combined
+                            frame = cv2.add(frame, overlay)
 
                     writer.write(frame)
                     self.frame_count += 1
@@ -331,8 +348,243 @@ def get_webcam_list():
     return cams
 
 
+def get_video_duration(path):
+    """Get video duration in seconds using OpenCV."""
+    if not HAS_CV2:
+        return 0
+    try:
+        cap = cv2.VideoCapture(path)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        cap.release()
+        if fps > 0:
+            return frames / fps
+    except Exception:
+        pass
+    return 0
+
+
+def convert_to_gif(video_path, output_path, fps=10, max_width=480):
+    """Convert a video file to GIF."""
+    if not HAS_CV2:
+        return False
+    try:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return False
+        orig_fps = cap.get(cv2.CAP_PROP_FPS)
+        frames = []
+        skip = max(1, int(orig_fps / fps))
+        count = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if count % skip == 0:
+                h, w = frame.shape[:2]
+                if w > max_width:
+                    ratio = max_width / w
+                    frame = cv2.resize(frame, (max_width, int(h * ratio)))
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frames.append(frame_rgb)
+            count += 1
+        cap.release()
+        if not frames:
+            return False
+        # Write GIF manually using PIL
+        try:
+            from PIL import Image
+            pil_frames = [Image.fromarray(f) for f in frames]
+            duration = int(1000 / fps)
+            pil_frames[0].save(
+                output_path, save_all=True, append_images=pil_frames[1:],
+                duration=duration, loop=0, optimize=True
+            )
+            return True
+        except ImportError:
+            return False
+    except Exception:
+        return False
+
+
+class CountdownOverlay(QWidget):
+    """Full-screen countdown overlay (3, 2, 1) before recording starts."""
+    countdown_done = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setWindowOpacity(0.85)
+        self._count = 3
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._scale = 1.0
+        self._scale_timer = QTimer(self)
+        self._scale_timer.timeout.connect(self._animate)
+        self._scale_timer.setInterval(16)
+
+    def start(self):
+        self._count = 3
+        self._scale = 1.0
+        screen = QApplication.primaryScreen().geometry()
+        self.setGeometry(screen)
+        self.showFullScreen()
+        self.raise_()
+        self._timer.start(800)
+        self._scale_timer.start()
+
+    def _tick(self):
+        self._count -= 1
+        self._scale = 1.0
+        self.update()
+        if self._count <= 0:
+            self._timer.stop()
+            self._scale_timer.stop()
+            self.hide()
+            self.countdown_done.emit()
+
+    def _animate(self):
+        self._scale = max(0.6, self._scale - 0.025)
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.fillRect(self.rect(), QColor(0, 0, 0, 120))
+        text = str(max(1, self._count))
+        p.save()
+        center = self.rect().center()
+        p.translate(center)
+        p.scale(self._scale, self._scale)
+        # glow
+        for i in range(3):
+            alpha = 40 - i * 12
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(0, 174, 255, alpha))
+            p.drawEllipse(QPoint(0, 0), 120 + i * 30, 120 + i * 30)
+        # number
+        font = QFont("Segoe UI", 120, QFont.Bold)
+        p.setFont(font)
+        p.setPen(QColor(255, 255, 255))
+        p.drawText(QRect(-200, -150, 400, 300), Qt.AlignCenter, text)
+        p.restore()
+        p.end()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self._timer.stop()
+            self._scale_timer.stop()
+            self.hide()
+            self.countdown_done.emit()
+
+
+class FloatingControlBar(QWidget):
+    """Mini floating control bar shown during recording."""
+    sig_stop = pyqtSignal()
+    sig_pause = pyqtSignal()
+    sig_draw = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setFixedHeight(48)
+        self.setMinimumWidth(320)
+        self._drag_pos = None
+        self._paused = False
+        self._init_ui()
+
+    def _init_ui(self):
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 4, 10, 4)
+        layout.setSpacing(6)
+
+        # recording indicator dot
+        self.dot_lbl = QLabel("●")
+        self.dot_lbl.setStyleSheet("color: #e74c3c; font-size: 14px;")
+        layout.addWidget(self.dot_lbl)
+
+        # timer
+        self.timer_lbl = QLabel("00:00:00")
+        self.timer_lbl.setFont(QFont("Consolas", 13, QFont.Bold))
+        self.timer_lbl.setStyleSheet("color: #e74c3c; background: transparent;")
+        layout.addWidget(self.timer_lbl)
+
+        layout.addSpacing(8)
+
+        # pause button
+        self.pause_btn = QPushButton("⏸")
+        self.pause_btn.setFixedSize(32, 32)
+        self.pause_btn.setToolTip("Pause / Resume")
+        self.pause_btn.setStyleSheet("""
+            QPushButton { background: #f39c12; color: white; border: none; border-radius: 16px; font-size: 14px; }
+            QPushButton:hover { background: #e67e22; }
+        """)
+        self.pause_btn.clicked.connect(self._on_pause)
+        layout.addWidget(self.pause_btn)
+
+        # draw toggle
+        self.draw_btn = QPushButton("✏")
+        self.draw_btn.setFixedSize(32, 32)
+        self.draw_btn.setToolTip("Toggle Drawing")
+        self.draw_btn.setStyleSheet("""
+            QPushButton { background: #3498db; color: white; border: none; border-radius: 16px; font-size: 14px; }
+            QPushButton:hover { background: #2980b9; }
+        """)
+        self.draw_btn.clicked.connect(self.sig_draw.emit)
+        layout.addWidget(self.draw_btn)
+
+        # stop button
+        self.stop_btn = QPushButton("⏹")
+        self.stop_btn.setFixedSize(32, 32)
+        self.stop_btn.setToolTip("Stop Recording")
+        self.stop_btn.setStyleSheet("""
+            QPushButton { background: #e74c3c; color: white; border: none; border-radius: 16px; font-size: 14px; }
+            QPushButton:hover { background: #c0392b; }
+        """)
+        self.stop_btn.clicked.connect(self.sig_stop.emit)
+        layout.addWidget(self.stop_btn)
+
+    def _on_pause(self):
+        self._paused = not self._paused
+        if self._paused:
+            self.pause_btn.setText("▶")
+            self.dot_lbl.setStyleSheet("color: #f39c12; font-size: 14px;")
+            self.timer_lbl.setStyleSheet("color: #f39c12; background: transparent;")
+        else:
+            self.pause_btn.setText("⏸")
+            self.dot_lbl.setStyleSheet("color: #e74c3c; font-size: 14px;")
+            self.timer_lbl.setStyleSheet("color: #e74c3c; background: transparent;")
+        self.sig_pause.emit()
+
+    def update_timer(self, t):
+        self.timer_lbl.setText(t)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setBrush(QColor(20, 20, 35, 220))
+        p.setPen(QPen(QColor(0, 174, 255, 100), 1))
+        p.drawRoundedRect(self.rect(), 14, 14)
+        p.end()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag_pos = event.globalPos() - self.frameGeometry().topLeft()
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self._drag_pos and event.buttons() == Qt.LeftButton:
+            self.move(event.globalPos() - self._drag_pos)
+            event.accept()
+
+    def mouseReleaseEvent(self, event):
+        self._drag_pos = None
+
+
 class DrawingOverlay(QWidget):
-    """Transparent overlay for drawing on screen during recording"""
+    """Transparent overlay for drawing on screen during recording."""
     closed = pyqtSignal()
 
     def __init__(self, draw_tools_ref):
@@ -342,22 +594,17 @@ class DrawingOverlay(QWidget):
         self.setMouseTracking(True)
         self.tools_ref = draw_tools_ref
         self.drawing_visible = False
-        self.current_tool = "pen"  # pen, arrow, rect, circle, text, eraser
+        self.current_tool = "pen"
         self.current_color = QColor(255, 0, 0)
         self.pen_width = 3
-        self._strokes = []  # list of (tool, color, width, points)
+        self._strokes = []
         self._current_stroke = []
         self._start_pos = None
         self._drawing = False
 
     def activate_tool(self, tool):
         self.current_tool = tool
-        if tool == "eraser":
-            self.setCursor(Qt.CrossCursor)
-        elif tool == "text":
-            self.setCursor(Qt.IBeamCursor)
-        else:
-            self.setCursor(Qt.CrossCursor)
+        self.setCursor(Qt.CrossCursor)
 
     def start_overlay(self):
         screen = QApplication.primaryScreen().geometry()
@@ -376,7 +623,6 @@ class DrawingOverlay(QWidget):
         self.update()
 
     def get_overlay_frame(self, w, h):
-        """Return a numpy overlay frame matching the recording resolution"""
         if not self._strokes:
             return None
         frame = np.zeros((h, w, 3), dtype=np.uint8)
@@ -385,7 +631,7 @@ class DrawingOverlay(QWidget):
         for tool, color, width, points in self._strokes:
             c = (color.blue(), color.green(), color.red())
             pw = max(1, int(width * sx))
-            if tool == "pen" or tool == "eraser":
+            if tool in ("pen", "eraser"):
                 ec = (0, 0, 0) if tool == "eraser" else c
                 for i in range(1, len(points)):
                     p1 = (int(points[i - 1].x() * sx), int(points[i - 1].y() * sy))
@@ -419,15 +665,13 @@ class DrawingOverlay(QWidget):
         painter.setRenderHint(QPainter.Antialiasing)
         for tool, color, width, points in self._strokes:
             pen = QPen(color if tool != "eraser" else QColor(255, 255, 255),
-                        width if tool != "eraser" else width * 4)
+                       width if tool != "eraser" else width * 4)
             painter.setPen(pen)
             if tool in ("pen", "eraser") and len(points) >= 2:
                 for i in range(1, len(points)):
                     painter.drawLine(points[i - 1], points[i])
             elif tool == "arrow" and len(points) >= 2:
                 painter.drawLine(points[0], points[-1])
-                # arrowhead
-                import math
                 dx = points[-1].x() - points[-2].x()
                 dy = points[-1].y() - points[-2].y()
                 angle = math.atan2(dy, dx)
@@ -455,7 +699,6 @@ class DrawingOverlay(QWidget):
             self._current_stroke = [event.pos()]
             self._drawing = True
         elif event.button() == Qt.RightButton:
-            # right click = undo last stroke
             if self._strokes:
                 self._strokes.pop()
                 self.update()
@@ -497,6 +740,8 @@ class MainWindow(QMainWindow):
         self.hotkey_listener = None
         self.selected_region = None
         self.draw_overlay = None
+        self.floating_bar = None
+        self.countdown = None
         self.recording_history = []
         self.audio_devices = get_audio_devices()
         self.webcam_list = get_webcam_list()
@@ -510,6 +755,7 @@ class MainWindow(QMainWindow):
         self._load_settings()
         self._center()
         self._update_file_count()
+        self._refresh_history()
 
     # ─── UI ──────────────────────────────────────────────────────
     def _init_ui(self):
@@ -534,7 +780,7 @@ class MainWindow(QMainWindow):
         t.setStyleSheet("color: white;")
         t.setAlignment(Qt.AlignCenter)
         hl.addWidget(t)
-        sub = QLabel(f"v{APP_VERSION}  •  Webcam PiP  •  Audio  •  Draw  •  GIF")
+        sub = QLabel(f"v{APP_VERSION}  •  Webcam PiP  •  Audio  •  Draw  •  GIF  •  Floating Controls")
         sub.setFont(QFont("Segoe UI", 9))
         sub.setStyleSheet("color: #8899aa;")
         sub.setAlignment(Qt.AlignCenter)
@@ -575,7 +821,6 @@ class MainWindow(QMainWindow):
         l1 = QVBoxLayout(w1)
         l1.setSpacing(8)
 
-        # Monitor
         mr = QHBoxLayout()
         mr.addWidget(QLabel("🖥  Monitor:"))
         self.monitor_combo = QComboBox()
@@ -583,7 +828,6 @@ class MainWindow(QMainWindow):
         mr.addWidget(self.monitor_combo, 1)
         l1.addLayout(mr)
 
-        # Region
         rr = QHBoxLayout()
         rr.addWidget(QLabel("📐  Region:"))
         self.region_combo = QComboBox()
@@ -592,7 +836,6 @@ class MainWindow(QMainWindow):
         rr.addWidget(self.region_combo, 1)
         l1.addLayout(rr)
 
-        # FPS
         fr = QHBoxLayout()
         fr.addWidget(QLabel("🎞  FPS:"))
         self.fps_spin = QSpinBox()
@@ -602,7 +845,6 @@ class MainWindow(QMainWindow):
         fr.addWidget(self.fps_spin, 1)
         l1.addLayout(fr)
 
-        # Quality
         qr = QHBoxLayout()
         qr.addWidget(QLabel("⭐  Quality:"))
         self.quality_slider = QSlider(Qt.Horizontal)
@@ -616,7 +858,6 @@ class MainWindow(QMainWindow):
         qr.addWidget(self.quality_lbl)
         l1.addLayout(qr)
 
-        # Codec
         cr = QHBoxLayout()
         cr.addWidget(QLabel("📦  Format:"))
         self.codec_combo = QComboBox()
@@ -624,7 +865,6 @@ class MainWindow(QMainWindow):
         cr.addWidget(self.codec_combo, 1)
         l1.addLayout(cr)
 
-        # Audio device
         ar = QHBoxLayout()
         ar.addWidget(QLabel("🎤  Audio:"))
         self.audio_check = QCheckBox("Record audio")
@@ -638,6 +878,23 @@ class MainWindow(QMainWindow):
             self.audio_check.setEnabled(False)
         ar.addWidget(self.audio_combo, 1)
         l1.addLayout(ar)
+
+        # Delay start
+        dr = QHBoxLayout()
+        dr.addWidget(QLabel("⏱  Delay Start:"))
+        self.delay_spin = QSpinBox()
+        self.delay_spin.setRange(0, 30)
+        self.delay_spin.setValue(0)
+        self.delay_spin.setSuffix(" sec")
+        self.delay_spin.setToolTip("0 = no countdown, 1-30 = countdown before recording")
+        dr.addWidget(self.delay_spin, 1)
+        l1.addLayout(dr)
+
+        # Cursor highlight
+        self.cursor_check = QCheckBox("Highlight mouse cursor during recording")
+        self.cursor_check.setChecked(False)
+        self.cursor_check.setStyleSheet("color: #f39c12;")
+        l1.addWidget(self.cursor_check)
 
         tabs.addTab(w1, "⚙ Settings")
 
@@ -716,7 +973,6 @@ class MainWindow(QMainWindow):
             tbr.addWidget(btn)
         l3.addLayout(tbr)
 
-        # color
         clr_row = QHBoxLayout()
         clr_row.addWidget(QLabel("Color:"))
         self.draw_color = QColor(255, 0, 0)
@@ -735,17 +991,81 @@ class MainWindow(QMainWindow):
 
         tabs.addTab(w3, "✏ Draw")
 
-        # ─── Tab 4: History ───
+        # ─── Tab 4: GIF Export ───
         w4 = QWidget()
         l4 = QVBoxLayout(w4)
+        l4.setSpacing(10)
+
+        gif_title = QLabel("🎬  GIF Export")
+        gif_title.setFont(QFont("Segoe UI", 14, QFont.Bold))
+        gif_title.setStyleSheet("color: #9b59b6;")
+        l4.addWidget(gif_title)
+
+        gif_desc = QLabel("Convert your last recording to an animated GIF.\nSelect a video file from History or browse manually.")
+        gif_desc.setStyleSheet("color: #888;")
+        gif_desc.setWordWrap(True)
+        l4.addWidget(gif_desc)
+
+        gif_fps_row = QHBoxLayout()
+        gif_fps_row.addWidget(QLabel("GIF FPS:"))
+        self.gif_fps_spin = QSpinBox()
+        self.gif_fps_spin.setRange(5, 30)
+        self.gif_fps_spin.setValue(10)
+        self.gif_fps_spin.setSuffix(" fps")
+        gif_fps_row.addWidget(self.gif_fps_spin, 1)
+        l4.addLayout(gif_fps_row)
+
+        gif_w_row = QHBoxLayout()
+        gif_w_row.addWidget(QLabel("Max Width:"))
+        self.gif_width_spin = QSpinBox()
+        self.gif_width_spin.setRange(240, 1920)
+        self.gif_width_spin.setValue(480)
+        self.gif_width_spin.setSuffix(" px")
+        self.gif_width_spin.setSingleStep(80)
+        gif_w_row.addWidget(self.gif_width_spin, 1)
+        l4.addLayout(gif_w_row)
+
+        self.gif_status = QLabel("")
+        self.gif_status.setStyleSheet("color: #2ecc71;")
+        l4.addWidget(self.gif_status)
+
+        gif_btns = QHBoxLayout()
+        self.gif_convert_btn = QPushButton("🔄  Convert Selected to GIF")
+        self.gif_convert_btn.setMinimumHeight(40)
+        self.gif_convert_btn.setStyleSheet("""
+            QPushButton { background: #9b59b6; color: white; border: none; border-radius: 8px;
+                          font-weight: bold; font-size: 11pt; padding: 8px 16px; }
+            QPushButton:hover { background: #8e44ad; }
+        """)
+        self.gif_convert_btn.clicked.connect(self._convert_to_gif)
+        gif_btns.addWidget(self.gif_convert_btn)
+        l4.addLayout(gif_btns)
+
+        gif_browse = QHBoxLayout()
+        self.gif_file_lbl = QLabel("No file selected")
+        self.gif_file_lbl.setStyleSheet("color: #888; font-size: 10px;")
+        gif_browse.addWidget(self.gif_file_lbl, 1)
+        gif_browse_btn = QPushButton("Browse Video")
+        gif_browse_btn.setFixedHeight(28)
+        gif_browse_btn.clicked.connect(self._browse_gif_source)
+        gif_browse.addWidget(gif_browse_btn)
+        l4.addLayout(gif_browse)
+
+        l4.addStretch()
+        tabs.addTab(w4, "🎞 GIF")
+
+        # ─── Tab 5: History ───
+        w5 = QWidget()
+        l5 = QVBoxLayout(w5)
         self.history_list = QListWidget()
         self.history_list.setStyleSheet("""
             QListWidget { background: #0d1117; color: #ccc; border: 1px solid #333;
                           border-radius: 6px; padding: 4px; }
-            QListWidget::item { padding: 6px; border-bottom: 1px solid #222; }
+            QListWidget::item { padding: 8px; border-bottom: 1px solid #222; }
             QListWidget::item:selected { background: #16213e; }
         """)
-        l4.addWidget(self.history_list)
+        self.history_list.itemDoubleClicked.connect(self._play_file)
+        l5.addWidget(self.history_list)
 
         hb = QHBoxLayout()
         open_btn = QPushButton("📂 Open Folder")
@@ -754,14 +1074,21 @@ class MainWindow(QMainWindow):
         refresh_btn = QPushButton("🔄 Refresh")
         refresh_btn.clicked.connect(self._refresh_history)
         hb.addWidget(refresh_btn)
-        l4.addLayout(hb)
+        play_btn = QPushButton("▶ Play Selected")
+        play_btn.clicked.connect(self._play_selected)
+        hb.addWidget(play_btn)
+        del_btn = QPushButton("🗑 Delete Selected")
+        del_btn.setStyleSheet("color: #e74c3c;")
+        del_btn.clicked.connect(self._delete_selected)
+        hb.addWidget(del_btn)
+        l5.addLayout(hb)
 
-        tabs.addTab(w4, "📋 History")
+        tabs.addTab(w5, "📋 History")
 
         sl.addWidget(tabs)
 
         # hotkey hint
-        hk = QLabel("⌨  F9 = Record/Stop   F10 = Pause   F11 = Screenshot")
+        hk = QLabel("⌨  F9 = Record/Stop   F10 = Pause   F11 = Screenshot   F12 = GIF Export")
         hk.setAlignment(Qt.AlignCenter)
         hk.setStyleSheet("color: #666; font-size: 10px; padding: 4px;")
         sl.addWidget(hk)
@@ -852,12 +1179,15 @@ class MainWindow(QMainWindow):
         p.end()
         self.tray.setIcon(QIcon(pix))
         self.tray.setToolTip(APP_NAME)
-        menu = QMenu()
-        menu.addAction("Show").triggered.connect(self._show)
-        menu.addAction("Stop").triggered.connect(self._stop_rec)
-        menu.addSeparator()
-        menu.addAction("Quit").triggered.connect(self._quit)
-        self.tray.setContextMenu(menu)
+        self.tray_menu = QMenu()
+        self.tray_menu.addAction("Show").triggered.connect(self._show)
+        self.tray_pause_action = self.tray_menu.addAction("Pause")
+        self.tray_pause_action.triggered.connect(self._toggle_pause)
+        self.tray_pause_action.setEnabled(False)
+        self.tray_menu.addAction("Stop").triggered.connect(self._stop_rec)
+        self.tray_menu.addSeparator()
+        self.tray_menu.addAction("Quit").triggered.connect(self._quit)
+        self.tray.setContextMenu(self.tray_menu)
         self.tray.activated.connect(
             lambda r: self._show() if r == QSystemTrayIcon.DoubleClick else None)
         self.tray.show()
@@ -874,6 +1204,8 @@ class MainWindow(QMainWindow):
                     QTimer.singleShot(0, self._toggle_pause)
                 elif key == pynput_kb.Key.f11:
                     QTimer.singleShot(0, self._screenshot)
+                elif key == pynput_kb.Key.f12:
+                    QTimer.singleShot(0, self._convert_to_gif)
             except Exception:
                 pass
         try:
@@ -899,6 +1231,10 @@ class MainWindow(QMainWindow):
                 self.webcam_size_slider.setValue(c.get("webcam_size", 25))
                 self.webcam_pos_combo.setCurrentIndex(c.get("webcam_pos", 0))
                 self.draw_check.setChecked(c.get("draw", False))
+                self.delay_spin.setValue(c.get("delay", 0))
+                self.cursor_check.setChecked(c.get("cursor_highlight", False))
+                self.gif_fps_spin.setValue(c.get("gif_fps", 10))
+                self.gif_width_spin.setValue(c.get("gif_width", 480))
         except Exception:
             pass
 
@@ -914,6 +1250,10 @@ class MainWindow(QMainWindow):
             "webcam_size": self.webcam_size_slider.value(),
             "webcam_pos": self.webcam_pos_combo.currentIndex(),
             "draw": self.draw_check.isChecked(),
+            "delay": self.delay_spin.value(),
+            "cursor_highlight": self.cursor_check.isChecked(),
+            "gif_fps": self.gif_fps_spin.value(),
+            "gif_width": self.gif_width_spin.value(),
         }
         try:
             with open(CONFIG_FILE, "w") as f:
@@ -984,6 +1324,7 @@ class MainWindow(QMainWindow):
                    "Top-Left": "top-left", "Bottom-Left": "bottom-left"}
         self.engine.webcam_pos = pos_map.get(self.webcam_pos_combo.currentText(), "bottom-right")
         self.engine.webcam_scale = self.webcam_size_slider.value() / 100.0
+        self.engine.cursor_highlight = self.cursor_check.isChecked()
 
         # drawing overlay
         if self.draw_check.isChecked():
@@ -991,10 +1332,25 @@ class MainWindow(QMainWindow):
             self.draw_overlay.current_color = self.draw_color
             self.draw_overlay.pen_width = self.pen_width_slider.value()
             self.engine.draw_overlay = self.draw_overlay
-            self.draw_overlay.start_overlay()
         else:
             self.engine.draw_overlay = None
 
+        self._pending_path = path
+
+        # countdown
+        delay = self.delay_spin.value()
+        if delay > 0:
+            self.countdown = CountdownOverlay()
+            self.countdown.countdown_done.connect(self._on_countdown_done)
+            self.countdown.start()
+        else:
+            self._actually_start_recording()
+
+    def _on_countdown_done(self):
+        self._actually_start_recording()
+
+    def _actually_start_recording(self):
+        path = self._pending_path
         if self.engine.start(path):
             self.record_btn.setText("⏹  Stop")
             self.record_btn.setStyleSheet(
@@ -1002,16 +1358,42 @@ class MainWindow(QMainWindow):
                 " padding: 8px 18px; font-weight: bold; font-size: 11pt; }"
                 "QPushButton:hover { background: #666; }")
             self.pause_btn.setEnabled(True)
+            self.tray_pause_action.setEnabled(True)
             self.status_lbl.setText("● Recording...")
             self.status_lbl.setStyleSheet("color: #e74c3c; font-weight: bold;")
             self.setWindowOpacity(0.85)
             self._lock_settings(True)
+
+            # floating control bar
+            if self.draw_overlay:
+                self.draw_overlay.start_overlay()
+            self.floating_bar = FloatingControlBar()
+            self.floating_bar.sig_stop.connect(self._stop_rec)
+            self.floating_bar.sig_pause.connect(self._toggle_pause)
+            self.floating_bar.sig_draw.connect(self._toggle_draw_from_float)
+            self.signals.timer_tick.connect(self.floating_bar.update_timer)
+            screen = QApplication.primaryScreen().geometry()
+            self.floating_bar.move(screen.width() // 2 - 160, 10)
+            self.floating_bar.show()
+
+    def _toggle_draw_from_float(self):
+        if self.draw_overlay and self.draw_overlay.drawing_visible:
+            self.draw_overlay.stop_overlay()
+        elif self.draw_overlay:
+            self.draw_overlay.start_overlay()
 
     def _stop_rec(self):
         self.engine.stop()
         if self.draw_overlay:
             self.draw_overlay.stop_overlay()
             self.draw_overlay = None
+        if self.floating_bar:
+            try:
+                self.signals.timer_tick.disconnect(self.floating_bar.update_timer)
+            except Exception:
+                pass
+            self.floating_bar.close()
+            self.floating_bar = None
         self.record_btn.setText("⏺  Record")
         self.record_btn.setStyleSheet(
             "QPushButton { background: #e74c3c; color: white; border: none; border-radius: 10px;"
@@ -1019,6 +1401,7 @@ class MainWindow(QMainWindow):
             "QPushButton:hover { background: #c0392b; }"
             "QPushButton:disabled { background: #333; color: #666; }")
         self.pause_btn.setEnabled(False)
+        self.tray_pause_action.setEnabled(False)
         self.pause_btn.setText("⏸  Pause")
         self.status_lbl.setText("● Processing...")
         self.status_lbl.setStyleSheet("color: #f39c12;")
@@ -1040,7 +1423,8 @@ class MainWindow(QMainWindow):
     def _lock_settings(self, lock):
         for w in [self.monitor_combo, self.region_combo, self.fps_spin,
                   self.quality_slider, self.codec_combo, self.audio_check,
-                  self.webcam_check, self.draw_check]:
+                  self.webcam_check, self.draw_check, self.delay_spin,
+                  self.cursor_check]:
             w.setEnabled(not lock)
 
     # ─── screenshot ──
@@ -1073,7 +1457,7 @@ class MainWindow(QMainWindow):
 
     def _on_region_sel(self, x, y, w, h):
         self.selected_region = (x, y, w, h)
-        self.status_lbl.setText(f"● Region: {w}×{h}")
+        self.status_lbl.setText(f"● Region: {w}x{h}")
 
     # ─── callbacks ──
     def _on_tick(self, t):
@@ -1084,7 +1468,10 @@ class MainWindow(QMainWindow):
         self.status_lbl.setStyleSheet("color: #4CAF50;")
         self.timer_lbl.setText("00:00:00")
         sz = os.path.getsize(path) if os.path.exists(path) else 0
-        self.tray.showMessage("Recording Saved", f"{os.path.basename(path)}\n{sz // 1024} KB",
+        sz_str = f"{sz // 1048576} MB" if sz >= 1048576 else f"{sz // 1024} KB"
+        dur = get_video_duration(path)
+        dur_str = f"  •  {int(dur//60)}:{int(dur%60):02d}" if dur > 0 else ""
+        self.tray.showMessage("Recording Saved", f"{os.path.basename(path)}\n{sz_str}{dur_str}",
                               QSystemTrayIcon.Information, 3000)
         self._update_file_count()
         self._refresh_history()
@@ -1094,6 +1481,52 @@ class MainWindow(QMainWindow):
         self.status_lbl.setStyleSheet("color: #e74c3c;")
         self._stop_rec()
 
+    # ─── GIF ──
+    def _browse_gif_source(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Video for GIF", self.folder_lbl.text(),
+            "Video Files (*.mp4 *.avi *.mkv);;All Files (*)")
+        if path:
+            self._gif_source = path
+            self.gif_file_lbl.setText(os.path.basename(path))
+
+    def _convert_to_gif(self):
+        source = getattr(self, '_gif_source', None)
+        if not source or not os.path.exists(source):
+            # try selected history item
+            item = self.history_list.currentItem()
+            if item:
+                source = item.data(Qt.UserRole)
+            if not source or not os.path.exists(source):
+                QMessageBox.information(self, "GIF Export", "Select a video file first.\n\nDouble-click History or use Browse Video.")
+                return
+
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        out = os.path.join(self.folder_lbl.text(), f"animation_{ts}.gif")
+        self.gif_status.setText("⏳ Converting... please wait")
+        self.gif_convert_btn.setEnabled(False)
+        QApplication.processEvents()
+
+        fps = self.gif_fps_spin.value()
+        max_w = self.gif_width_spin.value()
+
+        def do_convert():
+            result = convert_to_gif(source, out, fps=fps, max_width=max_w)
+            QTimer.singleShot(0, lambda: self._gif_done(result, out))
+
+        threading.Thread(target=do_convert, daemon=True).start()
+
+    def _gif_done(self, success, path):
+        self.gif_convert_btn.setEnabled(True)
+        if success:
+            sz = os.path.getsize(path) if os.path.exists(path) else 0
+            sz_str = f"{sz // 1048576} MB" if sz >= 1048576 else f"{sz // 1024} KB"
+            self.gif_status.setText(f"✅ Saved: {os.path.basename(path)} ({sz_str})")
+            self.tray.showMessage("GIF Saved", path, QSystemTrayIcon.Information, 2000)
+            self._refresh_history()
+        else:
+            self.gif_status.setText("❌ Conversion failed. Install Pillow: pip install Pillow")
+
     # ─── history ──
     def _refresh_history(self):
         self.history_list.clear()
@@ -1102,13 +1535,50 @@ class MainWindow(QMainWindow):
             return
         files = sorted(Path(d).glob("*.*"), key=lambda f: f.stat().st_mtime, reverse=True)
         for f in files:
-            if f.suffix.lower() in (".mp4", ".avi", ".mkv", ".png"):
+            if f.suffix.lower() in (".mp4", ".avi", ".mkv", ".png", ".gif", ".wav"):
                 sz = f.stat().st_size
                 dt = datetime.datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
                 sz_str = f"{sz // 1048576} MB" if sz >= 1048576 else f"{sz // 1024} KB"
-                item = QListWidgetItem(f"📹  {f.name}  •  {sz_str}  •  {dt}")
+                dur_str = ""
+                if f.suffix.lower() in (".mp4", ".avi", ".mkv"):
+                    dur = get_video_duration(str(f))
+                    if dur > 0:
+                        dur_str = f"  •  {int(dur//60)}:{int(dur%60):02d}"
+                icon = "🎬" if f.suffix.lower() in (".mp4", ".avi", ".mkv") else \
+                       "🎞" if f.suffix.lower() == ".gif" else \
+                       "📸" if f.suffix.lower() == ".png" else "🔊"
+                item = QListWidgetItem(f"{icon}  {f.name}  •  {sz_str}{dur_str}  •  {dt}")
                 item.setData(Qt.UserRole, str(f))
                 self.history_list.addItem(item)
+
+    def _play_selected(self):
+        item = self.history_list.currentItem()
+        if item:
+            path = item.data(Qt.UserRole)
+            if path and os.path.exists(path):
+                os.startfile(path)
+
+    def _play_file(self, item):
+        path = item.data(Qt.UserRole)
+        if path and os.path.exists(path):
+            os.startfile(path)
+
+    def _delete_selected(self):
+        item = self.history_list.currentItem()
+        if not item:
+            return
+        path = item.data(Qt.UserRole)
+        if path and os.path.exists(path):
+            r = QMessageBox.question(self, "Delete File",
+                                     f"Delete {os.path.basename(path)}?",
+                                     QMessageBox.Yes | QMessageBox.No)
+            if r == QMessageBox.Yes:
+                try:
+                    os.remove(path)
+                    self._refresh_history()
+                    self._update_file_count()
+                except Exception as e:
+                    QMessageBox.warning(self, "Error", str(e))
 
     def _open_output_folder(self):
         d = self.folder_lbl.text()
@@ -1119,7 +1589,13 @@ class MainWindow(QMainWindow):
         d = self.folder_lbl.text()
         if os.path.isdir(d):
             n = len([f for f in os.listdir(d) if f.endswith((".mp4", ".avi", ".mkv"))])
-            self.file_count_lbl.setText(f"{n} recording{'s' if n != 1 else ''} saved")
+            g = len([f for f in os.listdir(d) if f.endswith(".gif")])
+            parts = []
+            if n:
+                parts.append(f"{n} recording{'s' if n != 1 else ''}")
+            if g:
+                parts.append(f"{g} GIF{'s' if g != 1 else ''}")
+            self.file_count_lbl.setText(", ".join(parts) + " saved" if parts else "")
         else:
             self.file_count_lbl.setText("")
 
@@ -1129,6 +1605,7 @@ class MainWindow(QMainWindow):
         if d:
             self.folder_lbl.setText(d)
             self._update_file_count()
+            self._refresh_history()
 
     def _center(self):
         g = QApplication.primaryScreen().geometry()
@@ -1143,6 +1620,8 @@ class MainWindow(QMainWindow):
     def _quit(self):
         if self.engine.state != RecordingState.IDLE:
             self.engine.stop()
+        if self.floating_bar:
+            self.floating_bar.close()
         self._save_settings()
         QApplication.quit()
 
@@ -1200,7 +1679,7 @@ class RegionSelector(QWidget):
             p.setPen(QColor(255, 255, 255))
             p.setFont(QFont("Segoe UI", 12, QFont.Bold))
             p.drawText(r.adjusted(0, -28, 0, 0), Qt.AlignBottom | Qt.AlignHCenter,
-                       f"{r.width()} × {r.height()}")
+                       f"{r.width()} x {r.height()}")
 
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
