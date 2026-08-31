@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="primary">#00aeff</color>
+    <color name="primary_dark">#0088cc</color>
+    <color name="accent">#00aeff</color>
+    <color name="background">#0d1117</color>
+    <color name="surface">#161b22</color>
+    <color name="text_primary">#ffffff</color>
+    <color name="text_secondary">#aaaaaa</color>
+    <color name="status_ready">#4CAF50</color>
+    <color name="status_recording">#e74c3c</color>
+    <color name="status_paused">#f39c12</color>
+    <color name="button_record">#e74c3c</color>
+    <color name="button_pause">#f39c12</color>
+    <color name="button_stop">#555555</color>
+</resources>
