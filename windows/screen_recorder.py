@@ -1123,8 +1123,75 @@ class MainWindow(QMainWindow):
 
         self.file_count_lbl = QLabel("")
         self.file_count_lbl.setAlignment(Qt.AlignCenter)
-        self.file_count_lbl.setStyleSheet("color: #555; font-size: 10px;")
+        self.file_count_lbl.setStyleSheet("color: #555; font-size: 10px; padding-bottom: 4px;")
         sl.addWidget(self.file_count_lbl)
+
+        # ─── Developer Card ───
+        dev_frame = QFrame()
+        dev_frame.setStyleSheet("""
+            QFrame {
+                background: #161b22; border: 1px solid #333;
+                border-radius: 12px; padding: 4px;
+            }
+        """)
+        dev_layout = QVBoxLayout(dev_frame)
+        dev_layout.setContentsMargins(16, 14, 16, 14)
+        dev_layout.setSpacing(8)
+
+        dev_title = QLabel("👤  Developer")
+        dev_title.setFont(QFont("Segoe UI", 12, QFont.Bold))
+        dev_title.setStyleSheet("color: white; background: transparent; padding: 0;")
+        dev_layout.addWidget(dev_title)
+
+        def _make_link_row(icon, title, subtitle, url):
+            row = QFrame()
+            row.setCursor(Qt.PointingHandCursor)
+            row.setStyleSheet("""
+                QFrame { background: #0d1117; border: 1px solid #333; border-radius: 8px;
+                         padding: 6px; }
+                QFrame:hover { border-color: #00aeff; }
+            """)
+            rl = QHBoxLayout(row)
+            rl.setContentsMargins(12, 8, 12, 8)
+            rl.setSpacing(10)
+            ic = QLabel(icon)
+            ic.setFont(QFont("Segoe UI", 16))
+            ic.setStyleSheet("background: transparent; padding: 0;")
+            rl.addWidget(ic)
+            txt_col = QVBoxLayout()
+            txt_col.setSpacing(1)
+            tl = QLabel(title)
+            tl.setFont(QFont("Segoe UI", 10, QFont.Bold))
+            tl.setStyleSheet("color: white; background: transparent; padding: 0;")
+            txt_col.addWidget(tl)
+            sl2 = QLabel(subtitle)
+            sl2.setFont(QFont("Segoe UI", 9))
+            sl2.setStyleSheet("color: #00aeff; background: transparent; padding: 0;")
+            txt_col.addWidget(sl2)
+            rl.addLayout(txt_col, 1)
+            arrow = QLabel("→")
+            arrow.setFont(QFont("Segoe UI", 12))
+            arrow.setStyleSheet("color: #555; background: transparent; padding: 0;")
+            rl.addWidget(arrow)
+            row.mousePressEvent = lambda e, u=url: __import__('webbrowser').open(u)
+            return row
+
+        dev_layout.addWidget(_make_link_row("✈️", "Telegram", "@AnishtayiN", "https://t.me/AnishtayiN"))
+        dev_layout.addWidget(_make_link_row("🐙", "GitHub", "github.com/AnishtayiN", "https://github.com/AnishtayiN"))
+
+        star_btn = QPushButton("⭐  Star on GitHub")
+        star_btn.setMinimumHeight(36)
+        star_btn.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        star_btn.setCursor(Qt.PointingHandCursor)
+        star_btn.setStyleSheet("""
+            QPushButton { background: #0088cc; color: white; border: none;
+                          border-radius: 8px; padding: 6px; }
+            QPushButton:hover { background: #00aeff; }
+        """)
+        star_btn.clicked.connect(lambda: __import__('webbrowser').open("https://github.com/AnishtayiN/ScreenRecorder"))
+        dev_layout.addWidget(star_btn)
+
+        sl.addWidget(dev_frame)
 
         root.addWidget(scroll, 1)
 
