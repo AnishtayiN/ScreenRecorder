@@ -8,6 +8,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.util.Log
 import android.view.*
 import android.widget.TextView
 import android.view.animation.DecelerateInterpolator
@@ -15,6 +16,7 @@ import android.view.animation.DecelerateInterpolator
 class FloatingOverlayService : Service() {
 
     companion object {
+        private const val TAG = "FloatingOverlay"
         const val ACTION_START = "com.screenrecorder.FLOAT_START"
         const val ACTION_STOP = "com.screenrecorder.FLOAT_STOP"
         const val ACTION_UPDATE_TIMER = "com.screenrecorder.FLOAT_UPDATE_TIMER"
@@ -152,14 +154,18 @@ class FloatingOverlayService : Service() {
                 .withEndAction {
                     try {
                         windowManager?.removeView(overlayView)
-                    } catch (_: Exception) {}
+                    } catch (e: IllegalArgumentException) {
+                        Log.w(TAG, "Overlay already removed: ${e.message}")
+                    }
                     overlayView = null
                 }
                 .start()
         } ?: run {
             try {
                 windowManager?.removeView(overlayView)
-            } catch (_: Exception) {}
+            } catch (e: IllegalArgumentException) {
+                Log.w(TAG, "Overlay already removed: ${e.message}")
+            }
             overlayView = null
         }
     }

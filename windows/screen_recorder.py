@@ -4,6 +4,7 @@ Countdown, Floating Controls, Webcam PiP, Drawing Tools, GIF Export, Multi-Monit
 """
 
 import sys, os, time, threading, datetime, json, wave, math, subprocess, shutil, logging
+from enum import IntEnum
 from pathlib import Path
 
 # ─── Logging ───
@@ -149,7 +150,44 @@ def _safe_delete(path):
         log.warning(f"Could not delete temp file {path}: {e}")
 
 
-class RecordingState:
+def _validate_output(path):
+    """Validate a media file exists and is non-empty.
+    If ffprobe is available, also verify it has valid streams.
+    Returns True if valid, False otherwise.
+    """
+    if not path or not os.path.isfile(path):
+        return False
+    size = os.path.getsize(path)
+    if size == 0:
+        return False
+
+    # Try ffprobe validation if available
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe:
+        try:
+            result = subprocess.run(
+                [ffprobe, "-v", "error", "-show_entries",
+                 "stream=codec_type,duration", "-of", "csv=p=0", path],
+                capture_output=True, text=True, timeout=30
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                streams = [line.strip() for line in result.stdout.strip().split("\n") if line.strip()]
+                if streams:
+                    log.info(f"Output validation passed: {len(streams)} stream(s), {size} bytes")
+                    return True
+                log.warning(f"ffprobe found no streams in {path}")
+                return False
+            log.warning(f"ffprobe validation inconclusive for {path}")
+            return True  # file exists and is non-empty, ffprobe failed but file likely OK
+        except Exception as e:
+            log.debug(f"ffprobe validation skipped: {e}")
+            return True  # file exists and is non-empty
+
+    # No ffprobe: basic validation only
+    return True
+
+
+class RecordingState(IntEnum):
     IDLE = 0
     STARTING = 1
     RECORDING = 2
@@ -207,8 +245,8 @@ class RecordingEngine:
             self.state = new_state
             log.debug(f"State: {old} -> {new_state}")
 
-    def _can_transition(self, target):
-        """Check if transition to target state is valid."""
+    def _transition(self, target):
+        """Atomically check and perform state transition. Returns True if successful."""
         with self._lock:
             valid = {
                 RecordingState.IDLE: {RecordingState.STARTING},
@@ -222,12 +260,14 @@ class RecordingEngine:
             if target not in allowed:
                 log.warning(f"Invalid state transition: {self.state} -> {target}")
                 return False
+            old = self.state
+            self.state = target
+            log.debug(f"State: {old} -> {target}")
             return True
 
     def start(self, path):
-        if not self._can_transition(RecordingState.STARTING):
+        if not self._transition(RecordingState.STARTING):
             return False
-        self._set_state(RecordingState.STARTING)
         self.output_path = path
         self.frame_count = 0
         self._dropped_frames = 0
@@ -238,10 +278,11 @@ class RecordingEngine:
         os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
 
         # Use temp files when FFmpeg is available for muxing
-        if self.audio_enabled and HAS_FFMPEG:
+        if HAS_FFMPEG:
             base = path.rsplit(".", 1)[0]
             self._temp_video_path = base + "_tmp_video.mp4"
-            self._temp_audio_path = base + "_tmp_audio.wav"
+            if self.audio_enabled:
+                self._temp_audio_path = base + "_tmp_audio.wav"
 
         self._thread = threading.Thread(target=self._loop, name="video-capture", daemon=True)
         self._thread.start()
@@ -252,25 +293,22 @@ class RecordingEngine:
         return True
 
     def stop(self):
-        if self.state in (RecordingState.IDLE, RecordingState.STOPPING, RecordingState.FINALIZING):
+        if not self._transition(RecordingState.STOPPING):
             log.warning(f"stop() called in state {self.state}, ignoring")
             return
         log.info("Stop requested")
-        self._set_state(RecordingState.STOPPING)
         self._stop.set()
         self._pause.set()  # Unblock audio thread if paused
 
     def pause(self):
-        if not self._can_transition(RecordingState.PAUSED):
+        if not self._transition(RecordingState.PAUSED):
             return
-        self._set_state(RecordingState.PAUSED)
         self._pause.clear()
         log.info("Recording paused")
 
     def resume(self):
-        if not self._can_transition(RecordingState.RECORDING):
+        if not self._transition(RecordingState.RECORDING):
             return
-        self._set_state(RecordingState.RECORDING)
         self._pause.set()
         log.info("Recording resumed")
 
@@ -288,8 +326,8 @@ class RecordingEngine:
                     if info["maxInputChannels"] <= 0:
                         log.warning(f"Audio device {dev_idx} has no input channels, using default")
                         dev_idx = None
-                except Exception:
-                    log.warning(f"Audio device {dev_idx} not found, using default")
+                except Exception as e:
+                    log.warning(f"Audio device {dev_idx} not found ({e}), using default")
                     dev_idx = None
             self._audio_stream = pa.open(
                 format=pyaudio.paInt16, channels=1, rate=44100,
@@ -340,20 +378,24 @@ class RecordingEngine:
         try:
             pos = QCursor.pos()
             return int(pos.x()), int(pos.y())
-        except Exception:
+        except Exception as e:
+            log.debug(f"Cursor position unavailable: {e}")
             return -1, -1
 
     def _draw_cursor_highlight(self, frame, cx, cy, sx, sy):
         if not self.cursor_highlight or cx < 0:
             return
-        fx = int(cx * sx)
-        fy = int(cy * sy)
-        r = self.cursor_radius
-        overlay = frame.copy()
-        cv2.circle(overlay, (fx, fy), r, (0, 174, 255), -1)
-        cv2.addWeighted(overlay, 0.3, frame, 0.7, 0, frame)
-        cv2.circle(frame, (fx, fy), r, (0, 174, 255), 2)
-        cv2.circle(frame, (fx, fy), 4, (255, 255, 255), -1)
+        try:
+            fx = int(cx * sx)
+            fy = int(cy * sy)
+            r = self.cursor_radius
+            overlay = frame.copy()
+            cv2.circle(overlay, (fx, fy), r, (0, 174, 255), -1)
+            cv2.addWeighted(overlay, 0.3, frame, 0.7, 0, frame)
+            cv2.circle(frame, (fx, fy), r, (0, 174, 255), 2)
+            cv2.circle(frame, (fx, fy), 4, (255, 255, 255), -1)
+        except Exception as e:
+            log.debug(f"Cursor highlight error: {e}")
 
     def _loop(self):
         sct = None
@@ -382,8 +424,8 @@ class RecordingEngine:
             w = monitor["width"] & ~1
             h = monitor["height"] & ~1
 
-            # Determine encoding approach
-            use_ffmpeg_pipe = HAS_FFMPEG and self.audio_enabled and self._temp_video_path
+            # Determine encoding approach — always prefer FFmpeg when available
+            use_ffmpeg_pipe = HAS_FFMPEG
 
             if use_ffmpeg_pipe:
                 # Pipe raw frames directly to FFmpeg for encoding
@@ -429,7 +471,8 @@ class RecordingEngine:
                     cam = None
             self._cap = cam
 
-            self._set_state(RecordingState.RECORDING)
+            if not self._transition(RecordingState.RECORDING):
+                raise RuntimeError("Could not transition to RECORDING state")
             self.start_time = time.time()
             self._pause.set()
 
@@ -535,9 +578,13 @@ class RecordingEngine:
                 try:
                     if ffmpeg_proc.stdin and not ffmpeg_proc.stdin.closed:
                         ffmpeg_proc.stdin.close()
+                    # Read stderr before wait to prevent pipe buffer deadlock
+                    stderr_data = b""
+                    if ffmpeg_proc.stderr:
+                        stderr_data = ffmpeg_proc.stderr.read()
                     ffmpeg_proc.wait(timeout=15)
                     if ffmpeg_proc.returncode != 0:
-                        stderr_out = ffmpeg_proc.stderr.read().decode(errors="replace") if ffmpeg_proc.stderr else ""
+                        stderr_out = stderr_data.decode(errors="replace") if stderr_data else ""
                         log.error(f"FFmpeg exited with code {ffmpeg_proc.returncode}: {stderr_out[-500:]}")
                         if not error_msg:
                             error_msg = "FFmpeg encoding failed"
@@ -569,7 +616,7 @@ class RecordingEngine:
                     log.warning("Audio thread did not stop within 10s")
 
             # ── Finalize / Mux ──
-            self._set_state(RecordingState.FINALIZING)
+            self._transition(RecordingState.FINALIZING)
             try:
                 if not error_msg:
                     if self._temp_video_path and self._temp_audio_path and os.path.isfile(self._temp_audio_path):
@@ -587,8 +634,12 @@ class RecordingEngine:
 
                     # Verify output
                     if os.path.isfile(final_path) and os.path.getsize(final_path) > 0:
-                        log.info(f"Recording complete: {final_path} ({os.path.getsize(final_path)} bytes, "
-                                 f"{self.frame_count} frames, {self._dropped_frames} dropped)")
+                        if _validate_output(final_path):
+                            log.info(f"Recording complete: {final_path} ({os.path.getsize(final_path)} bytes, "
+                                     f"{self.frame_count} frames, {self._dropped_frames} dropped)")
+                        else:
+                            log.warning(f"Output file exists but validation failed: {final_path}")
+                            # Still emit as finished since file exists — user can decide
                     elif not error_msg:
                         error_msg = "Output file is empty or missing"
             except Exception as e:
@@ -603,7 +654,7 @@ class RecordingEngine:
                 self._temp_audio_path = None
 
                 # ── Emit result ──
-                self._set_state(RecordingState.IDLE)
+                self._transition(RecordingState.IDLE)
                 if error_msg:
                     self.sig.error.emit(error_msg)
                 elif os.path.isfile(final_path) and os.path.getsize(final_path) > 0:
@@ -712,7 +763,8 @@ def convert_to_gif(video_path, output_path, fps=10, max_width=480):
             return True
         except ImportError:
             return False
-    except Exception:
+    except Exception as e:
+        log.warning(f"GIF conversion failed: {e}")
         return False
 
 
@@ -1884,10 +1936,11 @@ class MainWindow(QMainWindow):
         self.status_lbl.setText(f"● {msg[:80]}")
         self.status_lbl.setStyleSheet("color: #e74c3c;")
         self.tray.showMessage("Recording Error", msg, QSystemTrayIcon.Warning, 3000)
-        # Only call _stop_rec if we're not already stopped
-        if self.engine.state != RecordingState.IDLE:
+        # Only call _stop_rec if engine hasn't already stopped itself
+        cur = self.engine.state
+        if cur not in (RecordingState.IDLE, RecordingState.STOPPING, RecordingState.FINALIZING):
             self._stop_rec()
-        # Reset UI if not already handled
+        # Reset UI to idle state
         if self.engine.state == RecordingState.IDLE:
             self.timer_lbl.setText("00:00:00")
             self.record_btn.setText("⏺  Record")

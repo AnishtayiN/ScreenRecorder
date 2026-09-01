@@ -300,5 +300,55 @@ class TestFileNamePattern(unittest.TestCase):
         self.assertIn('_', ts)
 
 
+class TestValidateOutput(unittest.TestCase):
+    def test_nonexistent_file(self):
+        self.assertFalse(screen_recorder._validate_output("/nonexistent/file.mp4"))
+
+    def test_empty_file(self):
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as f:
+            path = f.name
+        try:
+            self.assertFalse(screen_recorder._validate_output(path))
+        finally:
+            os.remove(path)
+
+    def test_nonempty_file(self):
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as f:
+            f.write(b'\x00' * 1024)
+            path = f.name
+        try:
+            self.assertTrue(screen_recorder._validate_output(path))
+        finally:
+            os.remove(path)
+
+    def test_none_path(self):
+        self.assertFalse(screen_recorder._validate_output(None))
+
+
+class TestTransitionAtomicity(unittest.TestCase):
+    def test_transition_succeeds(self):
+        sig = screen_recorder.EngineSignals()
+        engine = screen_recorder.RecordingEngine(sig)
+        self.assertTrue(engine._transition(screen_recorder.RecordingState.STARTING))
+        self.assertEqual(engine.state, screen_recorder.RecordingState.STARTING)
+
+    def test_transition_fails(self):
+        sig = screen_recorder.EngineSignals()
+        engine = screen_recorder.RecordingEngine(sig)
+        self.assertFalse(engine._transition(screen_recorder.RecordingState.RECORDING))
+        self.assertEqual(engine.state, screen_recorder.RecordingState.IDLE)
+
+    def test_full_valid_chain(self):
+        sig = screen_recorder.EngineSignals()
+        engine = screen_recorder.RecordingEngine(sig)
+        self.assertTrue(engine._transition(screen_recorder.RecordingState.STARTING))
+        self.assertTrue(engine._transition(screen_recorder.RecordingState.RECORDING))
+        self.assertTrue(engine._transition(screen_recorder.RecordingState.PAUSED))
+        self.assertTrue(engine._transition(screen_recorder.RecordingState.RECORDING))
+        self.assertTrue(engine._transition(screen_recorder.RecordingState.STOPPING))
+        self.assertTrue(engine._transition(screen_recorder.RecordingState.FINALIZING))
+        self.assertTrue(engine._transition(screen_recorder.RecordingState.IDLE))
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

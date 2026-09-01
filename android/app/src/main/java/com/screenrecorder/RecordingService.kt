@@ -240,17 +240,23 @@ class RecordingService : Service() {
         isRecording.set(false)
         try {
             virtualDisplay?.release()
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            Log.w(TAG, "cleanup: VirtualDisplay release error: ${e.message}")
+        }
         virtualDisplay = null
 
         try {
             mediaRecorder?.release()
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            Log.w(TAG, "cleanup: MediaRecorder release error: ${e.message}")
+        }
         mediaRecorder = null
 
         try {
             mediaProjection?.stop()
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            Log.w(TAG, "cleanup: MediaProjection stop error: ${e.message}")
+        }
         mediaProjection = null
 
         stopForeground(STOP_FOREGROUND_REMOVE)
