@@ -38,3 +38,8 @@ desktop.ini
 # Config
 *.env
 *.config.json
+
+# Tests
+.pytest_cache/
+.coverage
+htmlcov/

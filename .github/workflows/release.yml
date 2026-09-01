@@ -20,8 +20,31 @@ permissions:
   contents: write
 
 jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install test dependencies
+        run: |
+          pip install mss opencv-python numpy pyaudio pynput Pillow
+
+      - name: Syntax check
+        run: python -c "import ast; ast.parse(open('windows/screen_recorder.py').read()); print('Syntax OK')"
+
+      - name: Run unit tests
+        run: python -m unittest tests.test_windows -v
+
   build-windows:
     name: Build Windows EXE
+    needs: test
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -62,6 +85,7 @@ jobs:
 
   build-android:
     name: Build Android APK
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -81,7 +105,7 @@ jobs:
 
       - name: Install Android SDK components
         run: |
-          sdkmanager "platforms;android-34" "build-tools;34.0.0"
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -100,25 +124,25 @@ jobs:
           sed -i "s/versionCode [0-9]*/versionCode $VERSION_CODE/" android/app/build.gradle
           echo "Version set to $VER (code: $VERSION_CODE)"
 
-      - name: Build Debug APK
-        working-directory: android
-        run: gradle assembleDebug
-
       - name: Build Release APK
         working-directory: android
         run: gradle assembleRelease
-
-      - name: Upload Android Debug artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: android-apk
-          path: android/app/build/outputs/apk/debug/app-debug.apk
 
       - name: Upload Android Release artifact
         uses: actions/upload-artifact@v4
         with:
           name: android-apk-release
           path: android/app/build/outputs/apk/release/app-release-unsigned.apk
+
+      - name: Build Debug APK
+        working-directory: android
+        run: gradle assembleDebug
+
+      - name: Upload Android Debug artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk-debug
+          path: android/app/build/outputs/apk/debug/app-debug.apk
 
   release:
     name: Create GitHub Release
@@ -146,19 +170,32 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: windows-exe
-          path: artifacts/windows
-
-      - name: Download Android APK
-        uses: actions/download-artifact@v4
-        with:
-          name: android-apk
-          path: artifacts/android
+          path: artifacts
 
       - name: Download Android Release APK
         uses: actions/download-artifact@v4
         with:
           name: android-apk-release
-          path: artifacts/android-release
+          path: artifacts
+
+      - name: Download Android Debug APK
+        uses: actions/download-artifact@v4
+        with:
+          name: android-apk-debug
+          path: artifacts
+
+      - name: Rename artifacts
+        run: |
+          VER="${{ steps.version.outputs.name }}"
+          mv artifacts/ScreenRecorder.exe "artifacts/ScreenRecorder-Windows-${VER}.exe" 2>/dev/null || true
+          mv artifacts/app-release-unsigned.apk "artifacts/ScreenRecorder-Android-${VER}-release.apk" 2>/dev/null || true
+          mv artifacts/app-debug.apk "artifacts/ScreenRecorder-Android-${VER}-debug.apk" 2>/dev/null || true
+
+      - name: Generate checksums
+        working-directory: artifacts
+        run: |
+          sha256sum * > SHA256SUMS.txt 2>/dev/null || true
+          cat SHA256SUMS.txt
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
@@ -167,34 +204,42 @@ jobs:
           name: "Screen Recorder ${{ steps.version.outputs.name }}"
           body: |
             ## Screen Recorder ${{ steps.version.outputs.name }}
-            
+
             ### Windows (7 - 11)
-            - Download `ScreenRecorder.exe`
+            - Download `ScreenRecorder-Windows-${{ steps.version.outputs.name }}.exe`
             - No installation needed, just run it
             - Requirements: Windows 7 or later
-            
+            - Optional: [FFmpeg](https://ffmpeg.org/) for audio+video muxing (records as single MP4)
+
             ### Android (7.0+)
-            - Download `app-debug.apk` (Debug - easier to install)
+            - Download `ScreenRecorder-Android-${{ steps.version.outputs.name }}-release.apk` (unsigned)
             - Enable "Install from Unknown Sources" in settings
             - Requires Android 7.0 (API 24) or later
-            
-            ### Features
-            - Full screen and custom region recording
-            - Pause/Resume functionality
-            - Screenshot capture (Windows)
-            - Global hotkeys (F9/F10/F11)
-            - FPS, quality and format settings
-            - System tray support (Windows)
-            - Notification controls (Android)
-            
+
+            ### What's New
+            - FFmpeg muxing: audio + video combined into single file (Windows)
+            - Proper state machine for recording lifecycle (Windows)
+            - Thread-safe recording engine with deterministic cleanup
+            - Quality slider now affects actual output via CRF/FFmpeg
+            - Fixed MKV format (was using broken XVID codec)
+            - Android: removed unused INTERNET permission
+            - Android: atomic recording state, proper resource release order
+            - Structured logging for debugging
+            - Unit tests added
+
             ### Hotkeys (Windows)
             - **F9** - Start / Stop recording
             - **F10** - Pause / Resume
             - **F11** - Take screenshot
+            - **F12** - GIF Export
+
+            ### SHA-256 Checksums
+            See `SHA256SUMS.txt` in release assets.
           files: |
-            artifacts/windows/ScreenRecorder.exe
-            artifacts/android/app-debug.apk
-            artifacts/android-release/app-release-unsigned.apk
+            artifacts/ScreenRecorder-Windows-*.exe
+            artifacts/ScreenRecorder-Android-*-release.apk
+            artifacts/ScreenRecorder-Android-*-debug.apk
+            artifacts/SHA256SUMS.txt
           draft: false
           prerelease: ${{ steps.version.outputs.prerelease == 'true' }}
         env:

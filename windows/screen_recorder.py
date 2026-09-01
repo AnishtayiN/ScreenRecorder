@@ -3,8 +3,16 @@ Screen Recorder Pro v2.0 - Windows
 Countdown, Floating Controls, Webcam PiP, Drawing Tools, GIF Export, Multi-Monitor
 """
 
-import sys, os, time, threading, datetime, json, wave, math
+import sys, os, time, threading, datetime, json, wave, math, subprocess, shutil, logging
 from pathlib import Path
+
+# ─── Logging ───
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stderr)],
+)
+log = logging.getLogger("ScreenRecorder")
 
 try:
     from PyQt5.QtWidgets import (
@@ -55,10 +63,100 @@ CONFIG_FILE = str(Path.home() / ".screen_recorder_pro.json")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
+# ─── FFmpeg Detection ───
+def _find_ffmpeg():
+    """Find ffmpeg on PATH or common locations. Returns path or None."""
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        return ffmpeg
+    # Common Windows locations
+    for candidate in [
+        r"C:\ffmpeg\bin\ffmpeg.exe",
+        r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+        os.path.expanduser(r"~\ffmpeg\bin\ffmpeg.exe"),
+    ]:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+HAS_FFMPEG = _find_ffmpeg() is not None
+FFMPEG_PATH = _find_ffmpeg()
+
+if HAS_FFMPEG:
+    log.info(f"FFmpeg found: {FFMPEG_PATH}")
+else:
+    log.warning("FFmpeg not found. Audio/video muxing disabled. Install FFmpeg for combined output.")
+
+
+def _quality_to_crf(quality):
+    """Map quality slider (10-100) to FFmpeg CRF value.
+    quality 10  -> CRF 35 (low quality, small file)
+    quality 50  -> CRF 25 (medium)
+    quality 100 -> CRF 15 (high quality, large file)
+    """
+    return max(15, min(35, int(51 - (quality / 100.0 * 36))))
+
+
+def _mux_audio_video(video_path, audio_path, output_path):
+    """Mux separate video and audio files into a single media file using FFmpeg.
+    Returns True on success, False on failure.
+    """
+    if not HAS_FFMPEG:
+        log.warning("Cannot mux: FFmpeg not available")
+        return False
+    if not os.path.isfile(video_path):
+        log.error(f"Mux failed: video file not found: {video_path}")
+        return False
+    if not os.path.isfile(audio_path):
+        log.error(f"Mux failed: audio file not found: {audio_path}")
+        return False
+    cmd = [
+        FFMPEG_PATH, "-y",
+        "-i", video_path,
+        "-i", audio_path,
+        "-c:v", "copy",
+        "-c:a", "aac", "-b:a", "128k",
+        "-shortest",
+        output_path,
+    ]
+    log.info(f"Muxing: {' '.join(cmd)}")
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if result.returncode != 0:
+            log.error(f"FFmpeg mux failed (rc={result.returncode}): {result.stderr[-500:]}")
+            return False
+        if os.path.isfile(output_path) and os.path.getsize(output_path) > 0:
+            log.info(f"Mux success: {output_path} ({os.path.getsize(output_path)} bytes)")
+            return True
+        log.error(f"Mux output file missing or empty: {output_path}")
+        return False
+    except subprocess.TimeoutExpired:
+        log.error("FFmpeg mux timed out after 120s")
+        return False
+    except Exception as e:
+        log.error(f"Mux exception: {e}")
+        return False
+
+
+def _safe_delete(path):
+    """Safely delete a file, logging any errors."""
+    try:
+        if path and os.path.isfile(path):
+            os.remove(path)
+            log.info(f"Cleaned temp file: {path}")
+    except OSError as e:
+        log.warning(f"Could not delete temp file {path}: {e}")
+
+
 class RecordingState:
     IDLE = 0
-    RECORDING = 1
-    PAUSED = 2
+    STARTING = 1
+    RECORDING = 2
+    PAUSED = 3
+    STOPPING = 4
+    FINALIZING = 5
+    ERROR = 6
 
 
 class EngineSignals(QObject):
@@ -73,6 +171,7 @@ class RecordingEngine:
     def __init__(self, signals: EngineSignals):
         self.sig = signals
         self.state = RecordingState.IDLE
+        self._lock = threading.Lock()
         self._stop = threading.Event()
         self._pause = threading.Event()
         self._thread = None
@@ -98,45 +197,103 @@ class RecordingEngine:
         self.draw_overlay = None
         self.cursor_highlight = False
         self.cursor_radius = 20
+        self._temp_video_path = None
+        self._temp_audio_path = None
+        self._dropped_frames = 0
+
+    def _set_state(self, new_state):
+        with self._lock:
+            old = self.state
+            self.state = new_state
+            log.debug(f"State: {old} -> {new_state}")
+
+    def _can_transition(self, target):
+        """Check if transition to target state is valid."""
+        with self._lock:
+            valid = {
+                RecordingState.IDLE: {RecordingState.STARTING},
+                RecordingState.STARTING: {RecordingState.RECORDING, RecordingState.IDLE, RecordingState.ERROR},
+                RecordingState.RECORDING: {RecordingState.PAUSED, RecordingState.STOPPING},
+                RecordingState.PAUSED: {RecordingState.RECORDING, RecordingState.STOPPING},
+                RecordingState.STOPPING: {RecordingState.FINALIZING},
+                RecordingState.FINALIZING: {RecordingState.IDLE},
+            }
+            allowed = valid.get(self.state, set())
+            if target not in allowed:
+                log.warning(f"Invalid state transition: {self.state} -> {target}")
+                return False
+            return True
 
     def start(self, path):
-        if self.state != RecordingState.IDLE:
+        if not self._can_transition(RecordingState.STARTING):
             return False
+        self._set_state(RecordingState.STARTING)
         self.output_path = path
         self.frame_count = 0
+        self._dropped_frames = 0
         self._stop.clear()
         self._pause.clear()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._temp_video_path = None
+        self._temp_audio_path = None
+        os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
+
+        # Use temp files when FFmpeg is available for muxing
+        if self.audio_enabled and HAS_FFMPEG:
+            base = path.rsplit(".", 1)[0]
+            self._temp_video_path = base + "_tmp_video.mp4"
+            self._temp_audio_path = base + "_tmp_audio.wav"
+
+        self._thread = threading.Thread(target=self._loop, name="video-capture", daemon=True)
         self._thread.start()
         if self.audio_enabled:
-            self._audio_thread = threading.Thread(target=self._audio_loop, daemon=True)
+            self._audio_thread = threading.Thread(target=self._audio_loop, name="audio-capture", daemon=True)
             self._audio_thread.start()
+        log.info(f"Recording started: {path} (audio={self.audio_enabled}, ffmpeg={HAS_FFMPEG})")
         return True
 
     def stop(self):
-        self.state = RecordingState.IDLE
+        if self.state in (RecordingState.IDLE, RecordingState.STOPPING, RecordingState.FINALIZING):
+            log.warning(f"stop() called in state {self.state}, ignoring")
+            return
+        log.info("Stop requested")
+        self._set_state(RecordingState.STOPPING)
         self._stop.set()
-        self._pause.set()
+        self._pause.set()  # Unblock audio thread if paused
 
     def pause(self):
-        if self.state == RecordingState.RECORDING:
-            self.state = RecordingState.PAUSED
-            self._pause.clear()
+        if not self._can_transition(RecordingState.PAUSED):
+            return
+        self._set_state(RecordingState.PAUSED)
+        self._pause.clear()
+        log.info("Recording paused")
 
     def resume(self):
-        if self.state == RecordingState.PAUSED:
-            self.state = RecordingState.RECORDING
-            self._pause.set()
+        if not self._can_transition(RecordingState.RECORDING):
+            return
+        self._set_state(RecordingState.RECORDING)
+        self._pause.set()
+        log.info("Recording resumed")
 
     def _audio_loop(self):
         if not HAS_PYAUDIO:
             return
+        pa = None
         try:
             pa = pyaudio.PyAudio()
+            dev_idx = self.audio_device_index
+            # Validate device index
+            if dev_idx is not None:
+                try:
+                    info = pa.get_device_info_by_index(dev_idx)
+                    if info["maxInputChannels"] <= 0:
+                        log.warning(f"Audio device {dev_idx} has no input channels, using default")
+                        dev_idx = None
+                except Exception:
+                    log.warning(f"Audio device {dev_idx} not found, using default")
+                    dev_idx = None
             self._audio_stream = pa.open(
                 format=pyaudio.paInt16, channels=1, rate=44100,
-                input=True, input_device_index=self.audio_device_index,
+                input=True, input_device_index=dev_idx,
                 frames_per_buffer=1024
             )
             self._audio_frames = []
@@ -145,19 +302,39 @@ class RecordingEngine:
                     try:
                         data = self._audio_stream.read(1024, exception_on_overflow=False)
                         self._audio_frames.append(data)
-                    except Exception:
-                        pass
+                    except IOError as e:
+                        log.warning(f"Audio read overflow: {e}")
+                    except Exception as e:
+                        log.warning(f"Audio read error: {e}")
+                        break
+                else:
+                    time.sleep(0.01)  # Yield while paused
             self._audio_stream.stop_stream()
             self._audio_stream.close()
-            wav_path = self.output_path.rsplit(".", 1)[0] + "_audio.wav"
-            wf = wave.open(wav_path, "wb")
-            wf.setnchannels(1)
-            wf.setsampwidth(pa.get_sample_size(pyaudio.paInt16))
-            wf.setframerate(44100)
-            wf.writeframes(b"".join(self._audio_frames))
-            wf.close()
+            self._audio_stream = None
+
+            # Write WAV
+            if self._audio_frames:
+                wav_path = self._temp_audio_path or (self.output_path.rsplit(".", 1)[0] + "_audio.wav")
+                self._temp_audio_path = wav_path
+                wf = wave.open(wav_path, "wb")
+                wf.setnchannels(1)
+                wf.setsampwidth(pa.get_sample_size(pyaudio.paInt16))
+                wf.setframerate(44100)
+                wf.writeframes(b"".join(self._audio_frames))
+                wf.close()
+                log.info(f"Audio saved: {wav_path} ({len(self._audio_frames)} chunks)")
+            else:
+                log.warning("No audio frames captured")
         except Exception as e:
+            log.error(f"Audio capture error: {e}")
             self.sig.error.emit(f"Audio error: {e}")
+        finally:
+            if pa is not None:
+                try:
+                    pa.terminate()
+                except Exception:
+                    pass
 
     def _get_cursor_pos(self):
         try:
@@ -179,13 +356,19 @@ class RecordingEngine:
         cv2.circle(frame, (fx, fy), 4, (255, 255, 255), -1)
 
     def _loop(self):
+        sct = None
+        writer = None
+        cam = None
+        ffmpeg_proc = None
+        final_path = self.output_path
+        video_path = self._temp_video_path or self.output_path
+        error_msg = None
+
         try:
             if not HAS_MSS:
-                self.sig.error.emit("mss not installed: pip install mss")
-                return
+                raise RuntimeError("mss not installed: pip install mss")
             if not HAS_CV2:
-                self.sig.error.emit("opencv not installed: pip install opencv-python")
-                return
+                raise RuntimeError("opencv not installed: pip install opencv-python")
 
             sct = mss.mss()
             if self.region:
@@ -198,24 +381,55 @@ class RecordingEngine:
 
             w = monitor["width"] & ~1
             h = monitor["height"] & ~1
-            fourcc = cv2.VideoWriter_fourcc(*self.codec)
-            writer = cv2.VideoWriter(self.output_path, fourcc, self.fps, (w, h))
 
-            if not writer.isOpened():
-                self.sig.error.emit("Cannot open video writer. Try another codec.")
-                return
+            # Determine encoding approach
+            use_ffmpeg_pipe = HAS_FFMPEG and self.audio_enabled and self._temp_video_path
 
+            if use_ffmpeg_pipe:
+                # Pipe raw frames directly to FFmpeg for encoding
+                crf = _quality_to_crf(self.quality)
+                cmd = [
+                    FFMPEG_PATH, "-y",
+                    "-f", "rawvideo", "-vcodec", "rawvideo",
+                    "-s", f"{w}x{h}", "-pix_fmt", "bgr24",
+                    "-r", str(self.fps),
+                    "-i", "-",
+                    "-c:v", "libx264", "-preset", "fast",
+                    "-crf", str(crf),
+                    "-pix_fmt", "yuv420p",
+                    video_path,
+                ]
+                log.info(f"FFmpeg encode: CRF={crf}, {w}x{h}@{self.fps}fps -> {video_path}")
+                ffmpeg_proc = subprocess.Popen(
+                    cmd, stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+                )
+                writer = None
+            else:
+                # Fallback to OpenCV VideoWriter
+                fourcc = cv2.VideoWriter_fourcc(*self.codec)
+                writer = cv2.VideoWriter(video_path, fourcc, self.fps, (w, h))
+                if not writer.isOpened():
+                    raise RuntimeError(
+                        f"Cannot open video writer with codec '{self.codec}'. "
+                        "Try a different format or install FFmpeg."
+                    )
+                log.info(f"OpenCV writer: codec={self.codec}, {w}x{h}@{self.fps}fps -> {video_path}")
+
+            # Webcam setup
             cam = None
             if self.webcam_enabled and HAS_CV2:
                 try:
                     cam = cv2.VideoCapture(self.webcam_index)
                     if not cam.isOpened():
+                        log.warning(f"Webcam {self.webcam_index} not available")
                         cam = None
-                except Exception:
+                except Exception as e:
+                    log.warning(f"Webcam open failed: {e}")
                     cam = None
             self._cap = cam
 
-            self.state = RecordingState.RECORDING
+            self._set_state(RecordingState.RECORDING)
             self.start_time = time.time()
             self._pause.set()
 
@@ -273,17 +487,32 @@ class RecordingEngine:
                         if overlay is not None:
                             frame = cv2.add(frame, overlay)
 
-                    writer.write(frame)
+                    # Write frame
+                    if ffmpeg_proc and ffmpeg_proc.stdin:
+                        try:
+                            ffmpeg_proc.stdin.write(frame.tobytes())
+                        except BrokenPipeError:
+                            log.error("FFmpeg pipe broken")
+                            break
+                    elif writer:
+                        writer.write(frame)
+
                     self.frame_count += 1
 
-                    elapsed = time.time() - self.start_time
-                    hh = int(elapsed // 3600)
-                    mm = int((elapsed % 3600) // 60)
-                    ss = int(elapsed % 60)
-                    self.sig.timer_tick.emit(f"{hh:02d}:{mm:02d}:{ss:02d}")
+                    # Emit timer every ~1 second (not every frame)
+                    if self.frame_count % max(1, self.fps) == 0:
+                        elapsed = time.time() - self.start_time
+                        hh = int(elapsed // 3600)
+                        mm = int((elapsed % 3600) // 60)
+                        ss = int(elapsed % 60)
+                        self.sig.timer_tick.emit(f"{hh:02d}:{mm:02d}:{ss:02d}")
 
                 except Exception as e:
-                    self.sig.error.emit(f"Frame error: {e}")
+                    self._dropped_frames += 1
+                    if self._dropped_frames <= 3:
+                        log.warning(f"Frame error ({self._dropped_frames}): {e}")
+                    elif self._dropped_frames == 4:
+                        log.warning("Suppressing further frame error messages")
                     break
 
                 dt = time.time() - t0
@@ -291,17 +520,96 @@ class RecordingEngine:
                 if sl > 0:
                     time.sleep(sl)
 
-            writer.release()
-            if cam:
-                cam.release()
-            sct.close()
-
         except Exception as e:
-            self.sig.error.emit(f"Recording error: {e}")
+            error_msg = str(e)
+            log.error(f"Recording error: {e}")
         finally:
-            if self.state != RecordingState.IDLE and self.output_path:
-                self.sig.finished.emit(self.output_path)
-            self.state = RecordingState.IDLE
+            # ── Cleanup resources in deterministic order ──
+            if writer:
+                try:
+                    writer.release()
+                except Exception as e:
+                    log.warning(f"Writer release error: {e}")
+
+            if ffmpeg_proc:
+                try:
+                    if ffmpeg_proc.stdin and not ffmpeg_proc.stdin.closed:
+                        ffmpeg_proc.stdin.close()
+                    ffmpeg_proc.wait(timeout=15)
+                    if ffmpeg_proc.returncode != 0:
+                        stderr_out = ffmpeg_proc.stderr.read().decode(errors="replace") if ffmpeg_proc.stderr else ""
+                        log.error(f"FFmpeg exited with code {ffmpeg_proc.returncode}: {stderr_out[-500:]}")
+                        if not error_msg:
+                            error_msg = "FFmpeg encoding failed"
+                except subprocess.TimeoutExpired:
+                    log.warning("FFmpeg process timeout, force killing")
+                    ffmpeg_proc.kill()
+                except Exception as e:
+                    log.warning(f"FFmpeg cleanup error: {e}")
+
+            if cam:
+                try:
+                    cam.release()
+                except Exception as e:
+                    log.warning(f"Webcam release error: {e}")
+
+            if sct:
+                try:
+                    sct.close()
+                except Exception as e:
+                    log.warning(f"Screen capture close error: {e}")
+
+            self._cap = None
+
+            # ── Wait for audio thread ──
+            if self._audio_thread and self._audio_thread.is_alive():
+                log.info("Waiting for audio thread to finish...")
+                self._audio_thread.join(timeout=10)
+                if self._audio_thread.is_alive():
+                    log.warning("Audio thread did not stop within 10s")
+
+            # ── Finalize / Mux ──
+            self._set_state(RecordingState.FINALIZING)
+            try:
+                if not error_msg:
+                    if self._temp_video_path and self._temp_audio_path and os.path.isfile(self._temp_audio_path):
+                        # Mux video + audio into final file
+                        log.info("Muxing audio + video...")
+                        if _mux_audio_video(self._temp_video_path, self._temp_audio_path, final_path):
+                            log.info(f"Final output: {final_path}")
+                        else:
+                            log.error("Mux failed, falling back to video-only output")
+                            shutil.copy2(self._temp_video_path, final_path)
+                    elif self._temp_audio_path and os.path.isfile(self._temp_audio_path):
+                        # Audio-only (no video captured), just use WAV
+                        final_path = self._temp_audio_path
+                        self._temp_audio_path = None
+
+                    # Verify output
+                    if os.path.isfile(final_path) and os.path.getsize(final_path) > 0:
+                        log.info(f"Recording complete: {final_path} ({os.path.getsize(final_path)} bytes, "
+                                 f"{self.frame_count} frames, {self._dropped_frames} dropped)")
+                    elif not error_msg:
+                        error_msg = "Output file is empty or missing"
+            except Exception as e:
+                log.error(f"Finalization error: {e}")
+                if not error_msg:
+                    error_msg = f"Finalization error: {e}"
+            finally:
+                # ── Cleanup temp files ──
+                _safe_delete(self._temp_video_path)
+                _safe_delete(self._temp_audio_path)
+                self._temp_video_path = None
+                self._temp_audio_path = None
+
+                # ── Emit result ──
+                self._set_state(RecordingState.IDLE)
+                if error_msg:
+                    self.sig.error.emit(error_msg)
+                elif os.path.isfile(final_path) and os.path.getsize(final_path) > 0:
+                    self.sig.finished.emit(final_path)
+                else:
+                    self.sig.error.emit("Recording produced no output")
 
 
 def get_monitors():
@@ -329,7 +637,8 @@ def get_audio_devices():
                 devices.append((i, info["name"][:40]))
         pa.terminate()
         return devices
-    except Exception:
+    except Exception as e:
+        log.warning(f"Could not enumerate audio devices: {e}")
         return []
 
 
@@ -343,8 +652,8 @@ def get_webcam_list():
             if cap.isOpened():
                 cams.append((i, f"Camera {i}"))
                 cap.release()
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug(f"Webcam {i} probe failed: {e}")
     return cams
 
 
@@ -359,8 +668,8 @@ def get_video_duration(path):
         cap.release()
         if fps > 0:
             return frames / fps
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug(f"Could not read duration for {path}: {e}")
     return 0
 
 
@@ -861,9 +1170,23 @@ class MainWindow(QMainWindow):
         cr = QHBoxLayout()
         cr.addWidget(QLabel("📦  Format:"))
         self.codec_combo = QComboBox()
-        self.codec_combo.addItems(["MP4", "AVI (XVID)", "MKV (X264)"])
+        fmt_items = ["MP4 (H.264)", "AVI (MJPEG fallback)", "MKV (H.264)"]
+        if HAS_FFMPEG:
+            fmt_items = ["MP4 (H.264+AAC)", "AVI (H.264+AAC)", "MKV (H.264+AAC)"]
+        self.codec_combo.addItems(fmt_items)
         cr.addWidget(self.codec_combo, 1)
         l1.addLayout(cr)
+
+        # FFmpeg status indicator
+        ffmpeg_row = QHBoxLayout()
+        if HAS_FFMPEG:
+            ffmpeg_lbl = QLabel("✅  FFmpeg detected — audio/video muxing enabled")
+            ffmpeg_lbl.setStyleSheet("color: #4CAF50; font-size: 10px;")
+        else:
+            ffmpeg_lbl = QLabel("⚠  FFmpeg not found — audio saved as separate WAV. Install FFmpeg for muxing.")
+            ffmpeg_lbl.setStyleSheet("color: #f39c12; font-size: 10px;")
+        ffmpeg_row.addWidget(ffmpeg_lbl)
+        l1.addLayout(ffmpeg_row)
 
         ar = QHBoxLayout()
         ar.addWidget(QLabel("🎤  Audio:"))
@@ -1273,14 +1596,15 @@ class MainWindow(QMainWindow):
                     QTimer.singleShot(0, self._screenshot)
                 elif key == pynput_kb.Key.f12:
                     QTimer.singleShot(0, self._convert_to_gif)
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning(f"Hotkey handler error: {e}")
         try:
             l = pynput_kb.Listener(on_press=on_press)
             l.daemon = True
             l.start()
-        except Exception:
-            pass
+            log.info("Hotkey listener started (F9/F10/F11/F12)")
+        except Exception as e:
+            log.warning(f"Could not start hotkey listener: {e}")
 
     # ─── settings persistence ──
     def _load_settings(self):
@@ -1302,8 +1626,11 @@ class MainWindow(QMainWindow):
                 self.cursor_check.setChecked(c.get("cursor_highlight", False))
                 self.gif_fps_spin.setValue(c.get("gif_fps", 10))
                 self.gif_width_spin.setValue(c.get("gif_width", 480))
-        except Exception:
-            pass
+                log.info("Settings loaded")
+        except json.JSONDecodeError:
+            log.warning("Settings file corrupted, using defaults")
+        except Exception as e:
+            log.warning(f"Could not load settings: {e}")
 
     def _save_settings(self):
         c = {
@@ -1325,17 +1652,21 @@ class MainWindow(QMainWindow):
         try:
             with open(CONFIG_FILE, "w") as f:
                 json.dump(c, f)
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning(f"Could not save settings: {e}")
 
     # ─── codec ──
     def _codec_info(self):
+        """Return (opencv_fourcc, extension) for the selected format.
+        When FFmpeg is available, the actual encoding uses FFmpeg's libx264.
+        The opencv fallback codec is only used when FFmpeg is not available.
+        """
         i = self.codec_combo.currentIndex()
         if i == 0:
             return "mp4v", ".mp4"
         elif i == 1:
-            return "XVID", ".avi"
-        return "XVID", ".mkv"
+            return "MJPG", ".avi"
+        return "mp4v", ".mkv"
 
     def _make_path(self):
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1363,9 +1694,10 @@ class MainWindow(QMainWindow):
 
     # ─── recording ──
     def _toggle_rec(self):
+        # Check all non-IDLE states (STARTING, RECORDING, PAUSED, STOPPING, FINALIZING)
         if self.engine.state == RecordingState.IDLE:
             self._start_rec()
-        else:
+        elif self.engine.state in (RecordingState.RECORDING, RecordingState.PAUSED, RecordingState.STARTING):
             self._stop_rec()
 
     def _start_rec(self):
@@ -1450,6 +1782,8 @@ class MainWindow(QMainWindow):
             self.draw_overlay.start_overlay()
 
     def _stop_rec(self):
+        if self.engine.state in (RecordingState.IDLE, RecordingState.STOPPING, RecordingState.FINALIZING):
+            return
         self.engine.stop()
         if self.draw_overlay:
             self.draw_overlay.stop_overlay()
@@ -1457,8 +1791,8 @@ class MainWindow(QMainWindow):
         if self.floating_bar:
             try:
                 self.signals.timer_tick.disconnect(self.floating_bar.update_timer)
-            except Exception:
-                pass
+            except (TypeError, RuntimeError):
+                pass  # Signal not connected or already disconnected
             self.floating_bar.close()
             self.floating_bar = None
         self.record_btn.setText("⏺  Record")
@@ -1531,22 +1865,41 @@ class MainWindow(QMainWindow):
         self.timer_lbl.setText(t)
 
     def _on_finished(self, path):
+        log.info(f"Recording finished: {path}")
         self.status_lbl.setText("● Ready")
         self.status_lbl.setStyleSheet("color: #4CAF50;")
         self.timer_lbl.setText("00:00:00")
-        sz = os.path.getsize(path) if os.path.exists(path) else 0
-        sz_str = f"{sz // 1048576} MB" if sz >= 1048576 else f"{sz // 1024} KB"
-        dur = get_video_duration(path)
-        dur_str = f"  •  {int(dur//60)}:{int(dur%60):02d}" if dur > 0 else ""
-        self.tray.showMessage("Recording Saved", f"{os.path.basename(path)}\n{sz_str}{dur_str}",
-                              QSystemTrayIcon.Information, 3000)
+        if path and os.path.exists(path):
+            sz = os.path.getsize(path)
+            sz_str = f"{sz // 1048576} MB" if sz >= 1048576 else f"{sz // 1024} KB"
+            dur = get_video_duration(path)
+            dur_str = f"  •  {int(dur//60)}:{int(dur%60):02d}" if dur > 0 else ""
+            self.tray.showMessage("Recording Saved", f"{os.path.basename(path)}\n{sz_str}{dur_str}",
+                                  QSystemTrayIcon.Information, 3000)
         self._update_file_count()
         self._refresh_history()
 
     def _on_error(self, msg):
-        self.status_lbl.setText(f"● {msg}")
+        log.error(f"Engine error: {msg}")
+        self.status_lbl.setText(f"● {msg[:80]}")
         self.status_lbl.setStyleSheet("color: #e74c3c;")
-        self._stop_rec()
+        self.tray.showMessage("Recording Error", msg, QSystemTrayIcon.Warning, 3000)
+        # Only call _stop_rec if we're not already stopped
+        if self.engine.state != RecordingState.IDLE:
+            self._stop_rec()
+        # Reset UI if not already handled
+        if self.engine.state == RecordingState.IDLE:
+            self.timer_lbl.setText("00:00:00")
+            self.record_btn.setText("⏺  Record")
+            self.record_btn.setStyleSheet(
+                "QPushButton { background: #e74c3c; color: white; border: none; border-radius: 10px;"
+                " padding: 8px 18px; font-weight: bold; font-size: 11pt; }"
+                "QPushButton:hover { background: #c0392b; }"
+                "QPushButton:disabled { background: #333; color: #666; }")
+            self.pause_btn.setEnabled(False)
+            self.tray_pause_action.setEnabled(False)
+            self.setWindowOpacity(1.0)
+            self._lock_settings(False)
 
     # ─── GIF ──
     def _browse_gif_source(self):
@@ -1685,15 +2038,17 @@ class MainWindow(QMainWindow):
         self.raise_()
 
     def _quit(self):
-        if self.engine.state != RecordingState.IDLE:
+        if self.engine.state not in (RecordingState.IDLE, RecordingState.FINALIZING):
             self.engine.stop()
+            # Wait briefly for cleanup
+            time.sleep(0.5)
         if self.floating_bar:
             self.floating_bar.close()
         self._save_settings()
         QApplication.quit()
 
     def closeEvent(self, e):
-        if self.engine.state != RecordingState.IDLE:
+        if self.engine.state not in (RecordingState.IDLE, RecordingState.FINALIZING):
             r = QMessageBox.question(self, "Recording Active",
                                      "Stop recording and quit?", QMessageBox.Yes | QMessageBox.No)
             if r == QMessageBox.Yes:

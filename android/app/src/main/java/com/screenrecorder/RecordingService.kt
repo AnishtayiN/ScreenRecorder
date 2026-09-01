@@ -17,10 +17,12 @@ import androidx.core.app.NotificationCompat
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.*
+import java.util.concurrent.atomic.AtomicBoolean
 
 class RecordingService : Service() {
 
     companion object {
+        private const val TAG = "RecordingService"
         const val ACTION_START = "com.screenrecorder.START"
         const val ACTION_STOP = "com.screenrecorder.STOP"
         const val ACTION_PAUSE = "com.screenrecorder.PAUSE"
@@ -33,7 +35,7 @@ class RecordingService : Service() {
     private var virtualDisplay: VirtualDisplay? = null
     private var mediaRecorder: MediaRecorder? = null
     private var outputFile: String = ""
-    private var isRecording = false
+    private val isRecording = AtomicBoolean(false)
 
     private var width = 1920
     private var height = 1080
@@ -59,22 +61,26 @@ class RecordingService : Service() {
                 stopSelf()
             }
             ACTION_PAUSE -> {
-                pauseRecording()
-                updateNotification("Paused ⏸")
+                if (isRecording.get()) {
+                    pauseRecording()
+                    updateNotification("Paused ⏸")
+                }
             }
             ACTION_RESUME -> {
-                resumeRecording()
-                updateNotification("Recording ●")
+                if (isRecording.get().not()) {
+                    resumeRecording()
+                    updateNotification("Recording ●")
+                }
             }
         }
         return START_NOT_STICKY
     }
 
+    @Suppress("DEPRECATION")
     private fun startRecording(intent: Intent) {
         try {
             val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
             val metrics = DisplayMetrics()
-            @Suppress("DEPRECATION")
             wm.defaultDisplay.getRealMetrics(metrics)
 
             // Resolution
@@ -90,7 +96,7 @@ class RecordingService : Service() {
             width = width and 0x7FFFFFFE.toInt()
             height = height and 0x7FFFFFFE.toInt()
 
-            // FPS and quality
+            // FPS
             when (intent.getIntExtra("fps", 0)) {
                 0 -> fps = 30
                 1 -> fps = 60
@@ -98,6 +104,7 @@ class RecordingService : Service() {
                 3 -> fps = 15
             }
 
+            // Quality
             when (intent.getIntExtra("quality", 0)) {
                 0 -> bitrate = 8000000   // High
                 1 -> bitrate = 5000000   // Medium
@@ -106,7 +113,8 @@ class RecordingService : Service() {
             }
 
             // Output
-            val outputDir = intent.getStringExtra("outputDir") ?: "${getExternalFilesDir(null)}/ScreenRecorder"
+            val outputDir = intent.getStringExtra("outputDir")
+                ?: "${getExternalFilesDir(null)}/ScreenRecorder"
             File(outputDir).mkdirs()
             val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
             outputFile = "$outputDir/recording_$timestamp.mp4"
@@ -114,20 +122,19 @@ class RecordingService : Service() {
             // MediaRecorder setup
             mediaRecorder = MediaRecorder()
 
+            val hasAudio = intent.getBooleanExtra("audio", false)
+            val hasInternalAudio = intent.getBooleanExtra("internalAudio", false)
+                    && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+
             mediaRecorder!!.apply {
                 setVideoSource(MediaRecorder.VideoSource.SURFACE)
-
-                val hasAudio = intent.getBooleanExtra("audio", false)
-                val hasInternalAudio = intent.getBooleanExtra("internalAudio", false) && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+                setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
 
                 if (hasAudio || hasInternalAudio) {
                     setAudioSource(MediaRecorder.AudioSource.MIC)
-                    setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
                     setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
                     setAudioSamplingRate(44100)
                     setAudioEncodingBitRate(128000)
-                } else {
-                    setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
                 }
 
                 setVideoEncoder(MediaRecorder.VideoEncoder.H264)
@@ -143,12 +150,28 @@ class RecordingService : Service() {
             @Suppress("DEPRECATION")
             val data = intent.getParcelableExtra<Intent>("data")
 
+            if (data == null) {
+                Log.e(TAG, "MediaProjection data is null")
+                cleanupAndStop()
+                return
+            }
+
             val projManager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            mediaProjection = projManager.getMediaProjection(resultCode, data!!)
+            mediaProjection = projManager.getMediaProjection(resultCode, data)
+
+            if (mediaProjection == null) {
+                Log.e(TAG, "Failed to get MediaProjection")
+                cleanupAndStop()
+                return
+            }
 
             mediaProjection?.registerCallback(object : MediaProjection.Callback() {
                 override fun onStop() {
-                    if (isRecording) stopRecording()
+                    Log.d(TAG, "MediaProjection stopped externally")
+                    if (isRecording.get()) {
+                        stopRecording()
+                        // Notify activity if possible
+                    }
                 }
             }, null)
 
@@ -161,42 +184,98 @@ class RecordingService : Service() {
             )
 
             mediaRecorder!!.start()
-            isRecording = true
+            isRecording.set(true)
 
             updateNotification("Recording ●")
+            Log.i(TAG, "Recording started: ${width}x${height} @ ${fps}fps, bitrate=$bitrate, file=$outputFile")
 
+        } catch (e: IllegalStateException) {
+            Log.e(TAG, "MediaRecorder IllegalStateException (device may not support this config)", e)
+            cleanupAndStop()
+        } catch (e: SecurityException) {
+            Log.e(TAG, "SecurityException - missing permission", e)
+            cleanupAndStop()
         } catch (e: Exception) {
-            Log.e("ScreenRecorder", "Start recording failed", e)
-            stopSelf()
+            Log.e(TAG, "Start recording failed", e)
+            cleanupAndStop()
         }
     }
 
     private fun stopRecording() {
+        if (!isRecording.compareAndSet(true, false)) {
+            Log.d(TAG, "stopRecording: already stopped or never started")
+            return
+        }
+        // Release in correct order: VirtualDisplay -> MediaRecorder -> MediaProjection
         try {
-            isRecording = false
+            virtualDisplay?.release()
+        } catch (e: Exception) {
+            Log.w(TAG, "VirtualDisplay release error: ${e.message}")
+        }
+        virtualDisplay = null
+
+        try {
             mediaRecorder?.apply {
                 stop()
                 release()
             }
-            mediaRecorder = null
-            virtualDisplay?.release()
-            virtualDisplay = null
-            mediaProjection?.stop()
-            mediaProjection = null
+        } catch (e: IllegalStateException) {
+            Log.w(TAG, "MediaRecorder stop/release error: ${e.message}")
         } catch (e: Exception) {
-            Log.e("ScreenRecorder", "Stop recording failed", e)
+            Log.w(TAG, "MediaRecorder error: ${e.message}")
         }
+        mediaRecorder = null
+
+        try {
+            mediaProjection?.stop()
+        } catch (e: Exception) {
+            Log.w(TAG, "MediaProjection stop error: ${e.message}")
+        }
+        mediaProjection = null
+
+        Log.i(TAG, "Recording stopped, output: $outputFile")
+    }
+
+    private fun cleanupAndStop() {
+        isRecording.set(false)
+        try {
+            virtualDisplay?.release()
+        } catch (_: Exception) {}
+        virtualDisplay = null
+
+        try {
+            mediaRecorder?.release()
+        } catch (_: Exception) {}
+        mediaRecorder = null
+
+        try {
+            mediaProjection?.stop()
+        } catch (_: Exception) {}
+        mediaProjection = null
+
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
     }
 
     private fun pauseRecording() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            mediaRecorder?.pause()
+            try {
+                mediaRecorder?.pause()
+                Log.d(TAG, "Recording paused")
+            } catch (e: IllegalStateException) {
+                Log.w(TAG, "Pause failed (may not be started): ${e.message}")
+            }
         }
     }
 
     private fun resumeRecording() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            mediaRecorder?.resume()
+            try {
+                mediaRecorder?.resume()
+                Log.d(TAG, "Recording resumed")
+            } catch (e: IllegalStateException) {
+                Log.w(TAG, "Resume failed (may not be paused): ${e.message}")
+            }
         }
     }
 
@@ -253,7 +332,7 @@ class RecordingService : Service() {
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .addAction(R.drawable.ic_record, "Stop", stopPending)
 
-        if (isRecording) {
+        if (isRecording.get()) {
             builder.addAction(R.drawable.ic_pause, "Pause", pausePending)
         } else if (text.contains("Paused")) {
             builder.addAction(R.drawable.ic_record, "Resume", resumePending)
@@ -268,7 +347,7 @@ class RecordingService : Service() {
     }
 
     override fun onDestroy() {
-        if (isRecording) stopRecording()
+        if (isRecording.get()) stopRecording()
         super.onDestroy()
     }
 }
